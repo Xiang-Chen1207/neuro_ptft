@@ -28,6 +28,10 @@ def _group_files_by_subject(all_h5_files):
     return subject_files
 
 def _split_subjects(subject_files, seed, ratios=(0.8, 0.1)):
+    # Default is already 80/10/10 (0.8, 0.1 implies 0.1 test)
+    # User request: 80% train, 10% val, 10% test for full ft.
+    # Linear probing: 80% train, 20% test.
+    # We will handle linear probing logic by passing ratios=(0.8, 0.0) from the caller if needed.
     unique_subjects = sorted(list(subject_files.keys()))
     rng = np.random.RandomState(seed)
     rng.shuffle(unique_subjects)
@@ -76,6 +80,7 @@ def get_tuab_file_list(dataset_dir, mode, seed=42):
 
 def _index_worker(h5_path):
     samples = []
+    errors = []
     label_map = {'normal': 0, 'abnormal': 1}
     try:
         import h5py
@@ -106,15 +111,36 @@ def _index_worker(h5_path):
                         'segment_key': None,
                         'label': label
                     })
-    except Exception:
-        pass
-    return samples
+    except Exception as e:
+        errors.append({
+            'file_path': h5_path,
+            'trial_key': None,
+            'segment_key': None,
+            'stage': 'index',
+            'error': f"{type(e).__name__}: {e}",
+        })
+    return {'samples': samples, 'errors': errors}
+
+def _collate_drop_none(batch):
+    kept = [b for b in batch if b is not None]
+    dropped = len(batch) - len(kept)
+    if len(kept) == 0:
+        return None
+    xs, ys = zip(*kept)
+    x = torch.stack(xs, 0)
+    y0 = ys[0]
+    if isinstance(y0, torch.Tensor):
+        y = torch.stack(ys, 0)
+    else:
+        y = torch.as_tensor(ys)
+    return {'x': x, 'y': y, 'mask': None, 'dropped': dropped}
 
 class TUABDataset(Dataset):
     def __init__(self, file_list, input_size=12000, transform=None, cache_path='dataset_index.json', **kwargs):
         super().__init__()
         self.input_size = input_size
         self.transform = transform
+        self.drop_bad_samples = bool(kwargs.get('drop_bad_samples', True))
         
         # Standard 19 channels from cbramod_tuab/run_finetuning.py
         self.target_channels = ['FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'FZ', 'CZ', 'PZ']
@@ -136,8 +162,13 @@ class TUABDataset(Dataset):
         self.file_cache = OrderedDict()
         self.cache_size = 128 # Keep 128 files open per worker
 
+    @staticmethod
+    def collate(batch):
+        return _collate_drop_none(batch)
+
     def _load_or_generate_index(self, file_list, cache_path):
         full_index = []
+        error_index = []
         input_files_set = set(file_list)
         reindex = True
         
@@ -147,7 +178,11 @@ class TUABDataset(Dataset):
             try:
                 with open(cache_path, 'r') as f:
                     data = json.load(f)
-                    full_index = data if isinstance(data, list) else data.get('samples', [])
+                    if isinstance(data, list):
+                        full_index = data
+                    else:
+                        full_index = data.get('samples', [])
+                        error_index = data.get('errors', [])
                 
                 # Check coverage: Ensure all input files are in the cache
                 cached_files = set(s['file_path'] for s in full_index)
@@ -168,7 +203,8 @@ class TUABDataset(Dataset):
             max_workers = min(32, os.cpu_count() or 1)
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 results = list(tqdm(executor.map(_index_worker, file_list), total=len(file_list)))
-            new_samples = [s for res in results for s in res]
+            new_samples = [s for res in results for s in res.get('samples', [])]
+            new_errors = [e for res in results for e in res.get('errors', [])]
             
             # Merge with existing index if available to avoid losing other splits
             # (Though simple overwrite is safer if we assume we run this for all splits eventually)
@@ -179,12 +215,28 @@ class TUABDataset(Dataset):
                 existing_samples_map[key] = s
             
             full_index = list(existing_samples_map.values())
+            error_index.extend(new_errors)
             
             try:
                 with open(cache_path, 'w') as f:
-                    json.dump(full_index, f)
+                    bad_files = sorted(list({e.get('file_path') for e in error_index if e.get('file_path')}))
+                    payload = {
+                        'samples': full_index,
+                        'errors': error_index,
+                        'stats': {
+                            'n_files': len(file_list),
+                            'n_samples': len(full_index),
+                            'n_errors': len(error_index),
+                            'n_bad_files': len(bad_files),
+                        }
+                    }
+                    json.dump(payload, f)
             except Exception as e:
                 print(f"Warning: Could not save cache: {e}")
+            
+            if len(error_index) > 0:
+                bad_files = {e.get('file_path') for e in error_index if e.get('file_path')}
+                print(f"Index summary: samples={len(full_index)} errors={len(error_index)} bad_files={len(bad_files)}")
                 
         # 3. Filter for current split
         filtered_samples = [s for s in full_index if s['file_path'] in input_files_set]
@@ -242,9 +294,9 @@ class TUABDataset(Dataset):
                     self.file_cache.pop(h5_path).close()
                 except:
                     pass
-            print(f"Error loading {h5_path}: {e}")
-            # Still pass to avoid crashing training, but now we know about it
-            pass
+            if self.drop_bad_samples:
+                return None
+            raise RuntimeError(f"Bad sample: {h5_path} {trial_key}/{seg_key}: {type(e).__name__}: {e}") from e
 
         tensor = torch.from_numpy(data).float()
         # Normalize
@@ -257,5 +309,8 @@ class TUABDataset(Dataset):
         if self.input_size % patch_size == 0:
             num_patches = self.input_size // patch_size
             tensor = tensor.view(tensor.shape[0], num_patches, patch_size)
+
+        if self.transform is not None:
+            tensor = self.transform(tensor)
             
         return tensor, label

@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 from einops.layers.torch import Rearrange
 from .backbone import CBraModBackbone
+try:
+    from .eegmamba import EEGMambaBackbone
+except ImportError:
+    EEGMambaBackbone = None
 
 class CBraModWrapper(nn.Module):
     def __init__(self, config):
@@ -12,14 +16,26 @@ class CBraModWrapper(nn.Module):
         self._load_pretrained_weights(model_config)
 
     def _init_backbone(self, model_config):
-        self.backbone = CBraModBackbone(
-            in_dim=model_config.get('in_dim', 200),
-            d_model=model_config.get('d_model', 200),
-            dim_feedforward=model_config.get('dim_feedforward', 800),
-            seq_len=model_config.get('seq_len', 30),
-            n_layer=model_config.get('n_layer', 12),
-            nhead=model_config.get('nhead', 8)
-        )
+        model_name = model_config.get('name', 'cbramod')
+        
+        if model_name == 'eegmamba':
+             self.backbone = EEGMambaBackbone(
+                in_dim=model_config.get('in_dim', 200),
+                d_model=model_config.get('d_model', 200),
+                dim_feedforward=model_config.get('dim_feedforward', 800),
+                seq_len=model_config.get('seq_len', 30),
+                n_layer=model_config.get('n_layer', 12),
+                nhead=model_config.get('nhead', 8)
+            )
+        else:
+            self.backbone = CBraModBackbone(
+                in_dim=model_config.get('in_dim', 200),
+                d_model=model_config.get('d_model', 200),
+                dim_feedforward=model_config.get('dim_feedforward', 800),
+                seq_len=model_config.get('seq_len', 30),
+                n_layer=model_config.get('n_layer', 12),
+                nhead=model_config.get('nhead', 8)
+            )
 
     def _init_task_heads(self, config, model_config):
         self.task_type = config.get('task_type', 'classification')
@@ -94,7 +110,43 @@ class CBraModWrapper(nn.Module):
     def _init_classification_head(self, model_config):
         head_type = model_config.get('head_type', 'flatten')
         
-        if head_type == 'pooling':
+        if head_type == 'feat_cross_attn':
+            # For FeatOnly: Use Cross Attention like in Pretraining
+            self.fc_norm = nn.Identity()
+            self.feature_dim = model_config.get('feature_dim', 768)
+            self.feature_token_strategy = 'single'
+            
+            self.feat_query = nn.Parameter(torch.zeros(1, 1, self.d_model))
+            nn.init.normal_(self.feat_query, std=0.02)
+            
+            self.feat_attn = nn.MultiheadAttention(embed_dim=self.d_model, num_heads=4, batch_first=True)
+            
+            self.feat_head_mlp = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model),
+                nn.ReLU(),
+                nn.Linear(self.d_model, self.feature_dim)
+            )
+            
+            self.head = nn.Linear(self.feature_dim, self.num_classes)
+            
+        elif head_type == 'flagship_concat':
+            # For Flagship: 200dim eeg + 200dim feat -> 400 -> Classes
+            self.fc_norm = nn.LayerNorm(self.d_model)
+            
+            self.feature_dim = model_config.get('feature_dim', 768)
+            self.feature_token_strategy = 'single'
+            self.feat_query = nn.Parameter(torch.zeros(1, 1, self.d_model))
+            nn.init.normal_(self.feat_query, std=0.02)
+            self.feat_attn = nn.MultiheadAttention(embed_dim=self.d_model, num_heads=4, batch_first=True)
+            self.feat_head_mlp = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model),
+                nn.ReLU(),
+                nn.Linear(self.d_model, self.feature_dim)
+            )
+            
+            self.head = nn.Linear(self.d_model * 2, self.num_classes)
+            
+        elif head_type == 'pooling':
             self.fc_norm = nn.LayerNorm(self.d_model)
             self.head = nn.Linear(self.d_model, self.num_classes)
         else:
@@ -111,6 +163,14 @@ class CBraModWrapper(nn.Module):
             )
 
     def _load_pretrained_weights(self, model_config):
+        # We handle weight loading explicitly in the training script
+        # So we skip automatic loading here if not desired, 
+        # BUT the config usually has 'use_pretrained': true for the baseline backbone.
+        
+        # If the user script calls load_pretrained_model(), it will overwrite these anyway.
+        # But to be safe and avoid double loading or confusion, we can keep it.
+        # However, for FeatOnly/Flagship, we load specific checkpoints later.
+        
         if not model_config.get('use_pretrained', False):
             return
             
@@ -153,17 +213,17 @@ class CBraModWrapper(nn.Module):
         print(f"Missing keys: {missing}")
         # print(f"Unexpected keys: {unexpected}")
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, channel_mask=None, time_mask=None):
         if self.task_type == 'pretraining':
-            return self._forward_pretraining(x, mask)
+            return self._forward_pretraining(x, mask, channel_mask, time_mask)
         else:
-            return self._forward_classification(x)
+            return self._forward_classification(x, channel_mask, time_mask)
 
-    def _forward_pretraining(self, x, mask=None):
+    def _forward_pretraining(self, x, mask=None, channel_mask=None, time_mask=None):
         if mask is None:
-            mask = self._generate_mask(x)
+            mask = self._generate_mask(x, channel_mask=channel_mask, time_mask=time_mask)
             
-        feats = self.backbone(x, mask)
+        feats = self.backbone(x, mask, channel_mask=channel_mask, time_mask=time_mask)
         
         # Reconstruction Output
         out = self.head(feats) if self.head is not None else None
@@ -178,8 +238,29 @@ class CBraModWrapper(nn.Module):
                 
         return out, mask, feature_pred
 
-    def _forward_classification(self, x):
-        feats = self.backbone(x)
+    def _forward_classification(self, x, channel_mask=None, time_mask=None):
+        feats = self.backbone(x, channel_mask=channel_mask, time_mask=time_mask)
+        
+        # Check for custom heads
+        if getattr(self, 'feat_query', None) is not None:
+            # 1. Compute Cross Attn Features (Feat Path)
+            B, C, N, D = feats.shape
+            feats_flat = feats.view(B, C * N, D)
+            query = self.feat_query.expand(B, -1, -1)
+            attn_output, _ = self.feat_attn(query, feats_flat, feats_flat)
+            feat_token = attn_output.squeeze(1) # (B, 200)
+
+            if hasattr(self, 'fc_norm') and isinstance(self.fc_norm, nn.LayerNorm) and hasattr(self, 'feat_head_mlp') and self.head.in_features == 400:
+                 # Flagship Concat
+                 pooled = feats.mean(dim=[1, 2])
+                 eeg_feat = self.fc_norm(pooled) # (B, 200)
+                 concat_feat = torch.cat([eeg_feat, feat_token], dim=1) # (B, 400)
+                 return self.head(concat_feat)
+                 
+            elif hasattr(self, 'feat_head_mlp'):
+                 # FeatOnly CrossAttn
+                 feat_out = self.feat_head_mlp(feat_token) # (B, feature_dim)
+                 return self.head(feat_out)
         
         if isinstance(self.fc_norm, nn.LayerNorm):
             # Global Average Pooling
@@ -192,10 +273,22 @@ class CBraModWrapper(nn.Module):
             out = out.view(-1)
         return out
 
-    def _generate_mask(self, x):
+    def _generate_mask(self, x, channel_mask=None, time_mask=None):
         # Generate random mask (50% masking)
         B, C, N, P = x.shape
-        return torch.bernoulli(torch.full((B, C, N), 0.5, device=x.device)).to(x.device)
+        mask = torch.bernoulli(torch.full((B, C, N), 0.5, device=x.device)).to(x.device)
+        
+        # Ensure padded regions are NOT masked (mask=0) so we don't compute loss on them
+        # channel_mask: (B, C) - True if padded
+        # time_mask: (B, N) - True if padded
+        if channel_mask is not None:
+            # (B, C, 1)
+            mask = mask.masked_fill(channel_mask.unsqueeze(-1), 0.0)
+        if time_mask is not None:
+            # (B, 1, N)
+            mask = mask.masked_fill(time_mask.unsqueeze(1), 0.0)
+            
+        return mask
 
     def _forward_cross_attn_head(self, feats):
         # feats: (B, C, N, D) -> (B, S, D) where S = C*N

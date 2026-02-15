@@ -22,7 +22,7 @@ DATASET_DIR="/vePFS-0x0d/eeg-data/TUAB"
 
 # Weights Paths
 BASELINE_WEIGHTS="/vePFS-0x0d/home/chen/related_projects/CBraMod/pretrained_weights/pretrained_weights.pth"
-FLAGSHIP_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/flagship_fixed/checkpoint_epoch_16.pth"
+FLAGSHIP_WEIGHTS="/vePFS-0x0d/home/cx/ptft/output_old/flagship_cross_attn/checkpoint_epoch_6.pth"
 FEATONLY_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/sanity_feat_only_all_60s/checkpoint_epoch_27.pth" # Assuming relative path works or fix it if needed
 
 # === Initialization & Checks ===

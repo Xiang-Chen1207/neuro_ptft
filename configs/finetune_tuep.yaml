@@ -1,0 +1,48 @@
+
+task_type: classification
+output_dir: output/finetune_tuep
+device: cuda
+epochs: 20
+clip_grad: 1.0
+metric_key: balanced_acc
+val_freq_split: 1
+
+# Logging
+enable_wandb: true
+project: "ptft-project-tuep"
+entity: "bci-foundation-model" 
+api_key: "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"
+
+# Dataset Selection
+selected_dataset: TUEP
+
+datasets:
+  TUEP:
+    name: TUEP
+    dataset_dir: /vePFS-0x0d/home/cx/ptft/tuep
+    cache_path: output/finetune_tuep/dataset_index.json
+    seed: 42
+    batch_size: 32
+    num_workers: 4
+    input_size: 12000 # 60s * 200Hz
+
+model:
+  use_pretrained: true
+  pretrained_path: /vePFS-0x0d/home/chen/related_projects/CBraMod/pretrained_weights/pretrained_weights.pth
+  in_dim: 200
+  d_model: 200
+  dim_feedforward: 800
+  seq_len: 60 # 12000 / 200 = 60 patches
+  n_layer: 12
+  nhead: 8
+  dropout: 0.1
+  num_classes: 2 # No Epilepsy, With Epilepsy
+  head_type: pooling
+
+loss:
+  name: cross_entropy
+
+optimizer:
+  name: AdamW
+  lr: 0.0001
+  weight_decay: 0.05

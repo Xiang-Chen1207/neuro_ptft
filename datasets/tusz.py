@@ -48,9 +48,9 @@ def get_tusz_file_list(dataset_dir, mode='train', seed=42):
     
     n_subjects = len(unique_subjects)
     
-    # 60/20/20 split
-    n_train = int(n_subjects * 0.60)
-    n_val = int(n_subjects * 0.20)
+    # 80/10/10 split for full finetuning
+    n_train = int(n_subjects * 0.80)
+    n_val = int(n_subjects * 0.10)
     # Remaining 20% for test
     
     splits = {
@@ -71,6 +71,7 @@ def get_tusz_file_list(dataset_dir, mode='train', seed=42):
 
 def _index_worker(h5_path):
     samples = []
+    errors = []
     try:
         import h5py
         with h5py.File(h5_path, 'r') as f:
@@ -100,15 +101,53 @@ def _index_worker(h5_path):
                         'segment_key': seg_key,
                         'label': int(label)
                     })
-    except Exception:
-        pass
-    return samples
+    except Exception as e:
+        errors.append({
+            'file_path': h5_path,
+            'trial_key': None,
+            'segment_key': None,
+            'stage': 'index',
+            'error': f"{type(e).__name__}: {e}",
+        })
+    return {'samples': samples, 'errors': errors}
+
+def _collate_drop_none(batch):
+    kept = [b for b in batch if b is not None]
+    dropped = len(batch) - len(kept)
+    if len(kept) == 0:
+        return None
+    xs, ys = zip(*kept)
+    x0 = xs[0]
+
+    if isinstance(x0, torch.Tensor) and x0.ndim == 3:
+        c = x0.shape[0]
+        p = x0.shape[2]
+        max_n = max(x.shape[1] for x in xs)
+        x = torch.zeros(len(xs), c, max_n, p, dtype=x0.dtype)
+        mask = torch.ones(len(xs), max_n, dtype=torch.bool)
+        for i, xi in enumerate(xs):
+            n = xi.shape[1]
+            x[i, :, :n, :] = xi
+            mask[i, :n] = False
+    else:
+        x = torch.stack(xs, 0)
+        mask = None
+
+    y0 = ys[0]
+    if isinstance(y0, torch.Tensor):
+        y = torch.stack(ys, 0)
+    else:
+        y = torch.as_tensor(ys)
+    return {'x': x, 'y': y, 'mask': mask, 'dropped': dropped}
 
 class TUSZDataset(Dataset):
-    def __init__(self, file_list, input_size=2000, transform=None, cache_path='dataset_index_tusz.json', mode='train', **kwargs):
+    def __init__(self, file_list, input_size=2000, transform=None, cache_path='dataset_index_tusz.json', mode='train', dynamic_length=False, **kwargs):
         super().__init__()
         self.input_size = input_size # Default to 10s (2000 samples @ 200Hz)
         self.transform = transform
+        self.mode = mode
+        self.dynamic_length = dynamic_length
+        self.drop_bad_samples = bool(kwargs.get('drop_bad_samples', True))
         
         # Standard 19 channels
         self.target_channels = ['FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'FZ', 'CZ', 'PZ']
@@ -141,8 +180,13 @@ class TUSZDataset(Dataset):
         self.file_cache = OrderedDict()
         self.cache_size = 128
 
+    @staticmethod
+    def collate(batch):
+        return _collate_drop_none(batch)
+
     def _load_or_generate_index(self, file_list, cache_path):
         full_index = []
+        error_index = []
         input_files_set = set(file_list)
         reindex = True
         
@@ -151,7 +195,11 @@ class TUSZDataset(Dataset):
             try:
                 with open(cache_path, 'r') as f:
                     data = json.load(f)
-                    full_index = data if isinstance(data, list) else data.get('samples', [])
+                    if isinstance(data, list):
+                        full_index = data
+                    else:
+                        full_index = data.get('samples', [])
+                        error_index = data.get('errors', [])
                 
                 cached_files = set(s['file_path'] for s in full_index)
                 if input_files_set.issubset(cached_files):
@@ -166,7 +214,8 @@ class TUSZDataset(Dataset):
             max_workers = min(32, os.cpu_count() or 1)
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 results = list(tqdm(executor.map(_index_worker, file_list), total=len(file_list)))
-            new_samples = [s for res in results for s in res]
+            new_samples = [s for res in results for s in res.get('samples', [])]
+            new_errors = [e for res in results for e in res.get('errors', [])]
             
             # Merge with existing
             existing_samples_map = { (s['file_path'], s['trial_key'], s['segment_key']): s for s in full_index }
@@ -175,12 +224,28 @@ class TUSZDataset(Dataset):
                 existing_samples_map[key] = s
             
             full_index = list(existing_samples_map.values())
+            error_index.extend(new_errors)
             
             try:
                 with open(cache_path, 'w') as f:
-                    json.dump(full_index, f)
+                    bad_files = sorted(list({e.get('file_path') for e in error_index if e.get('file_path')}))
+                    payload = {
+                        'samples': full_index,
+                        'errors': error_index,
+                        'stats': {
+                            'n_files': len(file_list),
+                            'n_samples': len(full_index),
+                            'n_errors': len(error_index),
+                            'n_bad_files': len(bad_files),
+                        }
+                    }
+                    json.dump(payload, f)
             except Exception as e:
                 print(f"Warning: Could not save cache: {e}")
+            
+            if len(error_index) > 0:
+                bad_files = {e.get('file_path') for e in error_index if e.get('file_path')}
+                print(f"Index summary: samples={len(full_index)} errors={len(error_index)} bad_files={len(bad_files)}")
                 
         filtered_samples = [s for s in full_index if s['file_path'] in input_files_set]
         print(f"Dataset initialized: {len(filtered_samples)} samples.")
@@ -194,6 +259,11 @@ class TUSZDataset(Dataset):
         info = self.samples[idx]
         h5_path, trial_key, seg_key = info['file_path'], info['trial_key'], info['segment_key']
         label = info['label']
+
+        if label is None or int(label) < 0:
+            if self.drop_bad_samples:
+                return None
+            raise RuntimeError(f"Bad label: {h5_path} {trial_key}/{seg_key} label={label}")
         
         data = np.zeros((len(self.channel_indices), self.input_size), dtype=np.float32)
         
@@ -224,23 +294,56 @@ class TUSZDataset(Dataset):
                 raw = raw.T
             
             # Select channels
-            if raw.shape[0] >= 21: # Ensure we have enough channels
-                raw = raw[self.channel_indices, :]
+            out = np.zeros((len(self.channel_indices), raw.shape[1]), dtype=np.float32)
+            for i, ch_idx in enumerate(self.channel_indices):
+                if ch_idx < raw.shape[0]:
+                    out[i] = raw[ch_idx]
+            raw = out
             
             # Handle time dimension
             current_len = raw.shape[1]
-            if current_len >= self.input_size:
-                if self.mode == 'train':
-                    # Random crop for training
-                    start = np.random.randint(0, current_len - self.input_size + 1)
-                else:
-                    # Center crop for val/test
-                    start = (current_len - self.input_size) // 2
+            
+            if self.dynamic_length:
+                # Dynamic Patching Logic
+                patch_size = 200 # Fixed patch size
                 
-                data = raw[:, start:start+self.input_size]
+                # Check raw length first
+                # 1000s * 200Hz = 200000 samples
+                max_samples = 200000
+                
+                if current_len > max_samples:
+                    if self.drop_bad_samples:
+                        # Skip this sample entirely if it's too long (>1000s)
+                        return None
+                    else:
+                        # Truncate if we can't drop
+                        raw = raw[:, :max_samples]
+                        current_len = max_samples
+                
+                # Calculate number of patches
+                n_patches = current_len // patch_size
+                
+                if n_patches < 1:
+                    # Pad to at least 1 patch
+                    pad = patch_size - current_len
+                    data = np.pad(raw, ((0,0), (0, pad)), 'constant')
+                else:
+                    # Truncate to multiple of patch_size
+                    valid_len = n_patches * patch_size
+                    data = raw[:, :valid_len]
             else:
-                pad = self.input_size - current_len
-                data = np.pad(raw, ((0,0), (0, pad)), 'constant')
+                if current_len >= self.input_size:
+                    if self.mode == 'train':
+                        # Random crop for training
+                        start = np.random.randint(0, current_len - self.input_size + 1)
+                    else:
+                        # Center crop for val/test
+                        start = (current_len - self.input_size) // 2
+                    
+                    data = raw[:, start:start+self.input_size]
+                else:
+                    pad = self.input_size - current_len
+                    data = np.pad(raw, ((0,0), (0, pad)), 'constant')
                     
         except Exception as e:
             # If cache error, try to reopen
@@ -249,8 +352,9 @@ class TUSZDataset(Dataset):
                     self.file_cache.pop(h5_path).close()
                 except:
                     pass
-            # print(f"Error loading {h5_path}: {e}")
-            pass
+            if self.drop_bad_samples:
+                return None
+            raise RuntimeError(f"Bad sample: {h5_path} {trial_key}/{seg_key}: {type(e).__name__}: {e}") from e
 
         tensor = torch.from_numpy(data).float()
         
@@ -261,8 +365,15 @@ class TUSZDataset(Dataset):
         
         # Patchify
         patch_size = 200
-        if self.input_size % patch_size == 0:
+        if self.dynamic_length:
+             # data shape is (C, N*P) -> (C, N, P)
+             num_patches = tensor.shape[1] // patch_size
+             tensor = tensor.view(tensor.shape[0], num_patches, patch_size)
+        elif self.input_size % patch_size == 0:
             num_patches = self.input_size // patch_size
             tensor = tensor.view(tensor.shape[0], num_patches, patch_size)
+
+        if self.transform is not None:
+            tensor = self.transform(tensor)
 
         return tensor, label

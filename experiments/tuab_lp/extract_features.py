@@ -200,8 +200,8 @@ def main():
     
     # 1. Load Data
     print("Loading Dataset Index...")
-    train_files = get_tuab_file_list(args.dataset_dir, 'train', seed=42)
-    test_files = get_tuab_file_list(args.dataset_dir, 'test', seed=42)
+    train_files = get_tuab_file_list(args.dataset_dir, 'train', seed=6)
+    test_files = get_tuab_file_list(args.dataset_dir, 'test', seed=6)
     
     train_dataset = TUABDataset(train_files)
     test_dataset = TUABDataset(test_files)

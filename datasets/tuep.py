@@ -40,27 +40,55 @@ def get_tuep_file_list(dataset_dir, mode, seed=42):
     
     data_infos = []
     
+    # Debug: Check if dataset_dir exists
+    if not os.path.exists(dataset_dir):
+        print(f"Error: Dataset directory {dataset_dir} does not exist!")
+        return []
+    
+    # Try finding files recursively first as fallback
+    print(f"Searching for files in {dataset_dir}...")
+    all_files = {}
+    for root, _, files in os.walk(dataset_dir):
+        for f in files:
+            if f.endswith('.h5') and 'sub_' in f:
+                # Store full path mapped by filename or subject id
+                # Key: sub_aaaaaaar.h5 -> aaaaaaar
+                try:
+                    sid = f.split('sub_')[1].split('.')[0]
+                    all_files[sid] = os.path.join(root, f)
+                except:
+                    pass
+
+    print(f"Found {len(all_files)} total H5 files in directory.")
+
     for sub in no_ep_subs:
         if sub in excluded_subs: continue
+        
+        # Check direct path
         fname = f"sub_{sub}.h5"
         fpath = os.path.join(dataset_dir, fname)
-        # Handle recursive directory structure if needed, or simple path
-        if not os.path.exists(fpath):
-             # Fallback to recursive glob if not in root
-             # This is slow, so only do if needed.
-             # Or assume files are in root as per initial inspection.
-             # Let's try to find it.
-             pass
-             
+        
         if os.path.exists(fpath):
             data_infos.append({'path': fpath, 'label': 0, 'subject_id': sub})
+        elif sub in all_files:
+            data_infos.append({'path': all_files[sub], 'label': 0, 'subject_id': sub})
+        else:
+            # print(f"Warning: Subject {sub} file not found.")
+            pass
             
     for sub in with_ep_subs:
         if sub in excluded_subs: continue
+        
         fname = f"sub_{sub}.h5"
         fpath = os.path.join(dataset_dir, fname)
+        
         if os.path.exists(fpath):
             data_infos.append({'path': fpath, 'label': 1, 'subject_id': sub})
+        elif sub in all_files:
+            data_infos.append({'path': all_files[sub], 'label': 1, 'subject_id': sub})
+        else:
+            # print(f"Warning: Subject {sub} file not found.")
+            pass
             
     # Split by subject (stratified)
     class_0 = [x for x in data_infos if x['label'] == 0]
@@ -107,6 +135,7 @@ def _index_worker(info):
     h5_path = info['path']
     label = info['label']
     samples = []
+    errors = []
     
     try:
         with h5py.File(h5_path, 'r') as f:
@@ -129,15 +158,36 @@ def _index_worker(info):
                         'segment_key': None,
                         'label': label
                     })
-    except Exception:
-        pass
-    return samples
+    except Exception as e:
+        errors.append({
+            'file_path': h5_path,
+            'trial_key': None,
+            'segment_key': None,
+            'stage': 'index',
+            'error': f"{type(e).__name__}: {e}",
+        })
+    return {'samples': samples, 'errors': errors}
+
+def _collate_drop_none(batch):
+    kept = [b for b in batch if b is not None]
+    dropped = len(batch) - len(kept)
+    if len(kept) == 0:
+        return None
+    xs, ys = zip(*kept)
+    x = torch.stack(xs, 0)
+    y0 = ys[0]
+    if isinstance(y0, torch.Tensor):
+        y = torch.stack(ys, 0)
+    else:
+        y = torch.as_tensor(ys)
+    return {'x': x, 'y': y, 'mask': None, 'dropped': dropped}
 
 class TUEPDataset(Dataset):
     def __init__(self, file_list, input_size=12000, transform=None, cache_path='dataset_index_tuep.json', **kwargs):
         super().__init__()
         self.input_size = input_size
         self.transform = transform
+        self.drop_bad_samples = bool(kwargs.get('drop_bad_samples', True))
         
         # Standard 19 channels
         self.target_channels = ['FP1', 'FP2', 'F3', 'F4', 'C3', 'C4', 'P3', 'P4', 'O1', 'O2', 'F7', 'F8', 'T3', 'T4', 'T5', 'T6', 'FZ', 'CZ', 'PZ']
@@ -157,8 +207,13 @@ class TUEPDataset(Dataset):
         self.file_cache = OrderedDict()
         self.cache_size = 64
 
+    @staticmethod
+    def collate(batch):
+        return _collate_drop_none(batch)
+
     def _load_or_generate_index(self, file_list, cache_path):
         full_index = []
+        error_index = []
         # file_list contains dicts, so we use path as key
         input_files_set = set(item['path'] for item in file_list)
         reindex = True
@@ -169,7 +224,11 @@ class TUEPDataset(Dataset):
             try:
                 with open(cache_path, 'r') as f:
                     data = json.load(f)
-                    full_index = data if isinstance(data, list) else data.get('samples', [])
+                    if isinstance(data, list):
+                        full_index = data
+                    else:
+                        full_index = data.get('samples', [])
+                        error_index = data.get('errors', [])
                 
                 # Check coverage
                 cached_files = set(s['file_path'] for s in full_index)
@@ -186,7 +245,8 @@ class TUEPDataset(Dataset):
             max_workers = min(32, os.cpu_count() or 1)
             with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 results = list(tqdm(executor.map(_index_worker, file_list), total=len(file_list)))
-            new_samples = [s for res in results for s in res]
+            new_samples = [s for res in results for s in res.get('samples', [])]
+            new_errors = [e for res in results for e in res.get('errors', [])]
             
             existing_samples_map = { (s['file_path'], s['trial_key'], s['segment_key']): s for s in full_index }
             for s in new_samples:
@@ -194,12 +254,28 @@ class TUEPDataset(Dataset):
                 existing_samples_map[key] = s
             
             full_index = list(existing_samples_map.values())
+            error_index.extend(new_errors)
             
             try:
                 with open(cache_path, 'w') as f:
-                    json.dump(full_index, f)
+                    bad_files = sorted(list({e.get('file_path') for e in error_index if e.get('file_path')}))
+                    payload = {
+                        'samples': full_index,
+                        'errors': error_index,
+                        'stats': {
+                            'n_files': len(file_list),
+                            'n_samples': len(full_index),
+                            'n_errors': len(error_index),
+                            'n_bad_files': len(bad_files),
+                        }
+                    }
+                    json.dump(payload, f)
             except Exception as e:
                 print(f"Warning: Could not save cache: {e}")
+            
+            if len(error_index) > 0:
+                bad_files = {e.get('file_path') for e in error_index if e.get('file_path')}
+                print(f"Index summary: samples={len(full_index)} errors={len(error_index)} bad_files={len(bad_files)}")
                 
         # 3. Filter for current split
         filtered_samples = [s for s in full_index if s['file_path'] in input_files_set]
@@ -263,25 +339,9 @@ class TUEPDataset(Dataset):
                 # Given the error "index 17 is out of bounds for axis 0 with size 17",
                 # it means raw has 17 channels, but we asked for index 17 (which is the 18th channel).
                 # The file likely has fewer channels than the standard 21.
-                
-                # Robust approach: Use what we have, pad the rest.
-                # Or try to map dynamically if channel names are available.
-                # For speed, let's just pad if shape is smaller.
-                
-                n_avail = raw.shape[0]
-                new_raw = np.zeros((len(self.source_channels), raw.shape[1]), dtype=raw.dtype)
-                
-                # Copy as much as possible? No, that assumes order is same.
-                # If we don't know the order, we can't do much without reading channel names.
-                # Let's assume standard order but truncated? Unlikely.
-                # It's better to log a warning and return zeros for this sample to avoid crash.
-                print(f"Warning: Channel mismatch in {h5_path}. Expected indices up to {max(self.channel_indices)}, but got {n_avail} channels.")
-                raw = np.zeros((len(self.target_channels), self.input_size), dtype=np.float32)
-                # We set raw to zeros of target shape directly to skip selection logic below
-                # But we need to match the flow.
-                # Let's just return zero tensor immediately.
-                tensor = torch.zeros((len(self.target_channels), self.input_size // 200, 200), dtype=torch.float32)
-                return tensor, label
+                raise ValueError(
+                    f"Channel mismatch in {h5_path}. Expected max index {max(self.channel_indices)}, got {raw.shape[0]} channels."
+                )
 
             if raw.shape[1] < self.input_size:
                 pad = self.input_size - raw.shape[1]
@@ -292,8 +352,9 @@ class TUEPDataset(Dataset):
             if h5_path in self.file_cache:
                 try: self.file_cache.pop(h5_path).close()
                 except: pass
-            print(f"Error loading {h5_path}: {e}")
-            pass
+            if self.drop_bad_samples:
+                return None
+            raise RuntimeError(f"Bad sample: {h5_path} {trial_key}/{seg_key}: {type(e).__name__}: {e}") from e
 
         tensor = torch.from_numpy(data).float()
         # Normalize
@@ -306,5 +367,8 @@ class TUEPDataset(Dataset):
         if self.input_size % patch_size == 0:
             num_patches = self.input_size // patch_size
             tensor = tensor.view(tensor.shape[0], num_patches, patch_size)
+
+        if self.transform is not None:
+            tensor = self.transform(tensor)
             
         return tensor, label

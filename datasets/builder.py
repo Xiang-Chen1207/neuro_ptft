@@ -1,3 +1,4 @@
+import os
 from torch.utils.data import DataLoader
 
 def build_dataset(name, config, mode='train'):
@@ -97,6 +98,47 @@ def build_dataset(name, config, mode='train'):
             
         # 2. Initialize Dataset
         return SEEDDataset(file_list=file_list, mode=mode, **config)
+    elif name == 'SEEDIV':
+        from .seed_iv import SEEDIVDataset, get_seed_iv_file_list
+        dataset_dir = config.get('dataset_dir')
+        seed = config.get('seed', 42)
+        
+        file_list = get_seed_iv_file_list(dataset_dir, mode, seed=seed)
+        
+        if config.get('tiny', False):
+            print(f"[{mode}] Tiny mode active: Limiting file list to 5 files.")
+            file_list = file_list[:5]
+            
+        return SEEDIVDataset(file_list=file_list, mode=mode, **config)
+    elif name == 'BCIC2A':
+        from .bcic2a import BCIC2ADataset, get_bcic2a_file_list
+        dataset_dir = config.get('dataset_dir')
+        seed = config.get('seed', 42)
+        
+        # 1. Get split files
+        file_list = get_bcic2a_file_list(dataset_dir, mode, seed=seed)
+        
+        # Handle Tiny Mode
+        if config.get('tiny', False):
+            print(f"[{mode}] Tiny mode active: Limiting file list to 5 files.")
+            file_list = file_list[:5]
+            
+        # 2. Initialize Dataset
+        return BCIC2ADataset(file_list=file_list, mode=mode, **config)
+    elif name == 'JOINT':
+        from .joint import JointDataset, get_joint_file_list
+        # For JOINT, dataset_dir can point to the data.csv or be ignored if data_csv is provided separately
+        data_csv = config.get('data_csv', 'datasets/data.csv')
+        seed = config.get('seed', 42)
+        val_split = config.get('val_split', 0.1)
+        
+        file_list = get_joint_file_list(data_csv, mode, seed=seed, val_split=val_split)
+        
+        if config.get('tiny', False):
+            print(f"[{mode}] Tiny mode active: Limiting file list to 20 files.")
+            file_list = file_list[:20]
+            
+        return JointDataset(file_list=file_list, **config)
     else:
         raise ValueError(f"Dataset {name} not supported")
 
@@ -115,7 +157,7 @@ def build_dataloader(name, config, mode='train'):
         shuffle=shuffle,
         num_workers=config.get('num_workers', 4),
         collate_fn=collate_fn,
-        pin_memory=True,
+        pin_memory=config.get('pin_memory', True),
         persistent_workers=config.get('persistent_workers', True),
         prefetch_factor=config.get('prefetch_factor', 4) if config.get('num_workers', 4) > 0 else None
     )

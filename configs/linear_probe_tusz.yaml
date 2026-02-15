@@ -1,0 +1,39 @@
+task_type: pretraining # LP uses pretrained encoder
+output_dir: output/linear_probe_tusz
+device: cuda
+
+# Dataset
+selected_dataset: TUSZ
+datasets:
+  TUSZ:
+    name: TUSZ
+    dataset_dir: /vePFS-0x0d/home/hanrui/ptft_qwen/tuh_seizure_output/TUH_Seizure
+    cache_path: output/finetune_tusz/dataset_index.json
+    seed: 42
+    batch_size: 1 # Important for feature extraction with variable length
+    num_workers: 8
+    dynamic_length: true # Enable dynamic patching
+
+model:
+  # Architecture (Must match pretrained model)
+  in_dim: 200
+  d_model: 200
+  dim_feedforward: 800
+  seq_len: 10 # Nominal
+  n_layer: 12
+  nhead: 8
+  dropout: 0.1
+  
+  # Feature Extraction Settings
+  # These vary by model type (neuro_ke vs feat_only)
+  # but listed here for reference
+  feature_dim: 62 
+  feature_token_type: cross_attn
+  feature_token_strategy: single
+
+linear_probe:
+  # Logistic Regression Settings
+  optimizer: LBFGS
+  lr: 1.0
+  max_iter: 500
+  history_size: 20

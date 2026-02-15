@@ -183,17 +183,42 @@ def is_main_process():
 
 class WandbLogger:
     def __init__(self, config):
-        if is_main_process() and config.get('enable_wandb', False):
-            if config.get('api_key'):
-                os.environ['WANDB_API_KEY'] = config['api_key']
-            
+        self.active = False
+        if not is_main_process():
+            return
+
+        enable_wandb = config.get('enable_wandb', False)
+        if isinstance(enable_wandb, str):
+            enable_wandb = enable_wandb.strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not enable_wandb:
+            return
+
+        if config.get('api_key'):
+            os.environ['WANDB_API_KEY'] = config['api_key']
+
+        mode = config.get('wandb_mode') or os.environ.get('WANDB_MODE')
+        if isinstance(mode, str):
+            mode = mode.strip().lower()
+
+        netrc_path = os.path.expanduser("~/.netrc")
+        has_key = bool(os.environ.get("WANDB_API_KEY")) or bool(config.get("api_key"))
+        if not has_key and not os.path.exists(netrc_path):
+            mode = "disabled"
+
+        if mode in {"disabled"}:
+            os.environ["WANDB_MODE"] = "disabled"
+            return
+
+        try:
             wandb.init(
                 project=config.get('project', 'ptft-project'),
                 config=config,
-                entity=config.get('entity')
+                entity=config.get('entity'),
+                mode=mode,
             )
             self.active = True
-        else:
+        except Exception as e:
+            print(f"W&B disabled due to init failure: {e}")
             self.active = False
     
     def log(self, data, step=None):

@@ -5,9 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-: "${CHECKPOINT:=/vepfs-0x0d/home/cx/ptft/output/flagship_fixed/checkpoint_epoch_16.pth}"
+: "${CHECKPOINT:=/vePFS-0x0d/home/cx/ptft/output_old/flagship_cross_attn/checkpoint_epoch_6.pth}"
 : "${CONFIG:=configs/pretrain.yaml}"
-: "${OUTPUT:=/vepfs-0x0d/home/cx/ptft/experiments/feature_pred_validation/60sfeature_metrics_eval_full.csv}"
+: "${OUTPUT:=/vepfs-0x0d/home/cx/ptft/experiments/feature_pred_validation/val_full_final.csv}"
 : "${BATCH_SIZE:=256}"
 : "${DEVICE:=cuda}"
 
@@ -21,3 +21,4 @@ python eval_features.py \
   --split val
 
 echo "Done. Metrics saved to $OUTPUT"
+echo "Visualizations (Scatter Plots & Combined Figure) saved to ${OUTPUT%.*}_viz/"

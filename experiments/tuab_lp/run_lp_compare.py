@@ -4,7 +4,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import balanced_accuracy_score, accuracy_score
+import torch.nn.functional as F
+from sklearn.metrics import balanced_accuracy_score, accuracy_score, roc_auc_score, average_precision_score, f1_score
+from sklearn.preprocessing import label_binarize
 import warnings
 
 # Suppress warnings
@@ -19,6 +21,12 @@ class LogisticRegressionTorch(nn.Module):
         return self.linear(x)
 
 def run_experiment_gpu(X_train, y_train, X_test, y_test, seed, C=1.0, device='cuda'):
+    # Set seed for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     # Convert to Tensor
     X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
     y_train_t = torch.tensor(y_train, dtype=torch.long).to(device)
@@ -52,23 +60,43 @@ def run_experiment_gpu(X_train, y_train, X_test, y_test, seed, C=1.0, device='cu
     model.eval()
     with torch.no_grad():
         outputs = model(X_test_t)
+        probs = F.softmax(outputs, dim=1).cpu().numpy()
         _, predicted = torch.max(outputs.data, 1)
         y_pred = predicted.cpu().numpy()
         
     acc = accuracy_score(y_test, y_pred)
     bacc = balanced_accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average='weighted')
+    
+    # AUC metrics
+    try:
+        if num_classes == 2:
+            # Binary case
+            y_probs = probs[:, 1]
+            auroc = roc_auc_score(y_test, y_probs)
+            auc_pr = average_precision_score(y_test, y_probs)
+        else:
+            # Multi-class case
+            auroc = roc_auc_score(y_test, probs, multi_class='ovr', average='weighted')
+            y_test_bin = label_binarize(y_test, classes=np.arange(num_classes))
+            auc_pr = average_precision_score(y_test_bin, probs, average='weighted')
+    except Exception as e:
+        # print(f"Warning: AUC calculation failed: {e}")
+        auroc = 0.0
+        auc_pr = 0.0
     
     # Check convergence (simplified for LBFGS)
     converged = True 
     
-    return acc, bacc, converged, input_dim
+    return acc, bacc, auroc, auc_pr, f1, converged, input_dim
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--baseline_path', type=str, required=True, help='Path to baseline .npz file')
     parser.add_argument('--flagship_path', type=str, required=True, help='Path to flagship .npz file')
     parser.add_argument('--featonly_path', type=str, required=True, help='Path to feat_only .npz file')
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split_seed', type=int, default=42, help='Seed for subject splitting')
+    parser.add_argument('--train_seed', type=int, default=42, help='Seed for training')
     parser.add_argument('--ratios', type=float, nargs='+', 
                         default=[0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0], 
                         help='List of training set ratios (0.0 to 1.0)')
@@ -107,7 +135,7 @@ def main():
     
     # Pre-calculate incremental subject subsets
     # Shuffle once globally
-    rng = np.random.RandomState(args.seed)
+    rng = np.random.RandomState(args.split_seed)
     shuffled_subjects = unique_train_subjects.copy()
     rng.shuffle(shuffled_subjects)
     
@@ -123,8 +151,8 @@ def main():
         subsets[ratio] = (n_subs, selected)
         
     print("\n=== Comparative Results Table ===")
-    print(f"| {'Ratio':<8} | {'NumSub':<6} | {'Model':<12} | {'Feature':<10} | {'Dim':<5} | {'Acc':<7} | {'BAcc':<7} |")
-    print(f"|{'-'*10}|{'-'*8}|{'-'*14}|{'-'*12}|{'-'*7}|{'-'*9}|{'-'*9}|")
+    print(f"| {'Ratio':<8} | {'NumSub':<6} | {'Model':<12} | {'Feature':<10} | {'Dim':<5} | {'Acc':<7} | {'BAcc':<7} | {'AUROC':<7} | {'AUC-PR':<7} | {'F1':<7} |")
+    print(f"|{'-'*10}|{'-'*8}|{'-'*14}|{'-'*12}|{'-'*7}|{'-'*9}|{'-'*9}|{'-'*9}|{'-'*9}|{'-'*9}|")
     
     # Iterate over ratios
     for ratio in sorted(args.ratios):
@@ -147,11 +175,11 @@ def main():
         X_test_bl = baseline_data['test_eeg']
         y_test_bl = baseline_data['test_labels']
         
-        acc, bacc, _, dim = run_experiment_gpu(
+        acc, bacc, auroc, auc_pr, f1, _, dim = run_experiment_gpu(
             X_train_bl, y_train_bl, X_test_bl, y_test_bl, 
-            args.seed, device=args.device
+            args.train_seed, device=args.device
         )
-        print(f"| {ratio_display:<8} | {n_subs:<6} | {'Baseline':<12} | {'EEG':<10} | {dim:<5} | {acc*100:.2f}% | {bacc*100:.2f}% |")
+        print(f"| {ratio_display:<8} | {n_subs:<6} | {'Baseline':<12} | {'EEG':<10} | {dim:<5} | {acc*100:.2f}% | {bacc*100:.2f}% | {auroc:.4f}  | {auc_pr:.4f}  | {f1:.4f}  |")
         
         # 2. Run Flagship (Neuro-KE - All Features)
         mask_train_fs = np.isin(flagship_data['train_subjects'], selected_subjects)
@@ -177,11 +205,11 @@ def main():
             # Skip if feature not available (e.g. some runs might not have pred)
             if 'X_train_fs' not in locals(): continue
                 
-            acc, bacc, _, dim = run_experiment_gpu(
+            acc, bacc, auroc, auc_pr, f1, _, dim = run_experiment_gpu(
                 X_train_fs, y_train_fs, X_test_fs, flagship_data['test_labels'], 
-                args.seed, device=args.device
+                args.train_seed, device=args.device
             )
-            print(f"| {ratio_display:<8} | {n_subs:<6} | {'Neuro-KE':<12} | {ftype:<10} | {dim:<5} | {acc*100:.2f}% | {bacc*100:.2f}% |")
+            print(f"| {ratio_display:<8} | {n_subs:<6} | {'Neuro-KE':<12} | {ftype:<10} | {dim:<5} | {acc*100:.2f}% | {bacc*100:.2f}% | {auroc:.4f}  | {auc_pr:.4f}  | {f1:.4f}  |")
             
         # 3. Run FeatOnly (Feat Prediction Only - All Features)
         mask_train_fo = np.isin(featonly_data['train_subjects'], selected_subjects)
@@ -206,11 +234,11 @@ def main():
                 X_train_fo = featonly_data['train_pred'][mask_train_fo]
                 X_test_fo = featonly_data['test_pred']
                 
-            acc, bacc, _, dim = run_experiment_gpu(
+            acc, bacc, auroc, auc_pr, f1, _, dim = run_experiment_gpu(
                 X_train_fo, y_train_fo, X_test_fo, featonly_data['test_labels'], 
-                args.seed, device=args.device
+                args.train_seed, device=args.device
             )
-            print(f"| {ratio_display:<8} | {n_subs:<6} | {'FeatOnly':<12} | {ftype:<10} | {dim:<5} | {acc*100:.2f}% | {bacc*100:.2f}% |")
+            print(f"| {ratio_display:<8} | {n_subs:<6} | {'FeatOnly':<12} | {ftype:<10} | {dim:<5} | {acc*100:.2f}% | {bacc*100:.2f}% | {auroc:.4f}  | {auc_pr:.4f}  | {f1:.4f}  |")
 
 if __name__ == '__main__':
     main()

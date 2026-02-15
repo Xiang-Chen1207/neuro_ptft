@@ -1,0 +1,48 @@
+task_type: classification
+output_dir: output/finetune_tusz_dynamic
+device: cuda
+epochs: 10
+clip_grad: 1.0
+metric_key: balanced_acc
+val_freq_split: 5
+
+# Logging
+enable_wandb: true
+project: "ptft-project-tusz"
+entity: "bci-foundation-model" 
+api_key: "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"
+
+# Dataset Selection
+selected_dataset: TUSZ
+
+datasets:
+  TUSZ:
+    name: TUSZ
+    dataset_dir: /vePFS-0x0d/home/hanrui/ptft_qwen/tuh_seizure_output/TUH_Seizure
+    cache_path: output/finetune_tusz/dataset_index.json
+    seed: 42
+    batch_size: 32
+    num_workers: 8
+    input_size: 2000 # Ignored if dynamic_length=True
+    dynamic_length: true
+
+model:
+  use_pretrained: true
+  pretrained_path: /vePFS-0x0d/home/chen/related_projects/CBraMod/pretrained_weights/pretrained_weights.pth
+  in_dim: 200
+  d_model: 200
+  dim_feedforward: 800
+  seq_len: 10 # Ignored by dynamic patching but kept for structure
+  n_layer: 12
+  nhead: 8
+  dropout: 0.1
+  num_classes: 13
+  head_type: pooling
+
+loss:
+  name: cross_entropy
+
+optimizer:
+  name: AdamW
+  lr: 0.0001
+  weight_decay: 0.05

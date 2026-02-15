@@ -12,14 +12,31 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
+    skipped_batches = 0
+    dropped_items = 0
 
     for data_iter_step, batch in enumerate(metric_logger.log_every(dataloader, print_freq, header)):
+        if batch is None:
+            skipped_batches += 1
+            continue
+
         # Unpack batch
-        if len(batch) == 2:
+        if isinstance(batch, dict):
+            x = batch['x']
+            y = batch['y']
+            mask = batch.get('mask')
+            channel_mask = batch.get('channel_mask')
+            time_mask = batch.get('time_mask')
+            dropped_items += int(batch.get('dropped', 0) or 0)
+        elif len(batch) == 2:
             x, y = batch
             mask = None
+            channel_mask = None
+            time_mask = None
         else:
             x, y, mask = batch 
+            channel_mask = None
+            time_mask = None
 
         x = x.to(device).float()
         
@@ -36,12 +53,16 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
         
         if mask is not None:
              mask = mask.to(device)
+        if channel_mask is not None:
+             channel_mask = channel_mask.to(device)
+        if time_mask is not None:
+             time_mask = time_mask.to(device)
 
         optimizer.zero_grad()
         
         # Forward pass
         if task_type == "pretraining":
-             outputs = model(x, mask=mask)
+             outputs = model(x, mask=mask, channel_mask=channel_mask, time_mask=time_mask)
              feature_pred = None
              
              if isinstance(outputs, tuple):
@@ -199,6 +220,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
+    if skipped_batches > 0 or dropped_items > 0:
+        print(f"{header} skipped_batches={skipped_batches} dropped_items={dropped_items}")
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
@@ -208,6 +231,8 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
     
     preds = []
     targets = []
+    skipped_batches = 0
+    dropped_items = 0
     
     last_batch_viz = None # Initialize to avoid scope issues
     
@@ -240,8 +265,17 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
     for i, batch in enumerate(iterator):
         if limit_batches is not None and i >= limit_batches:
             break
+
+        if batch is None:
+            skipped_batches += 1
+            continue
             
-        if len(batch) == 2:
+        if isinstance(batch, dict):
+            x = batch['x']
+            y = batch['y']
+            mask = batch.get('mask')
+            dropped_items += int(batch.get('dropped', 0) or 0)
+        elif len(batch) == 2:
             x, y = batch
             mask = None
         else:
@@ -348,6 +382,8 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
     metric_logger.synchronize_between_processes()
     if verbose:
         print('* loss {losses.global_avg:.3f}'.format(losses=metric_logger.loss))
+        if skipped_batches > 0 or dropped_items > 0:
+            print(f"{header} skipped_batches={skipped_batches} dropped_items={dropped_items}")
     
     metrics = {
         "loss": metric_logger.loss.global_avg,

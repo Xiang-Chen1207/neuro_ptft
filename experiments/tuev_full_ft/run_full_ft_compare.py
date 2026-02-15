@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, Subset
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from sklearn.metrics import balanced_accuracy_score, f1_score
+from sklearn.metrics import balanced_accuracy_score, f1_score, accuracy_score, roc_auc_score, average_precision_score
+from sklearn.preprocessing import label_binarize
 import logging
 
 # Add project root to path
@@ -90,7 +90,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler):
         optimizer.zero_grad()
         
         # Forward pass
-        with autocast():
+        with torch.amp.autocast('cuda'):
             output = model(data)
             
             # Check output type
@@ -120,6 +120,7 @@ def evaluate(model, dataloader, criterion, device):
     total_loss = 0
     all_preds = []
     all_targets = []
+    all_probs = []
     
     with torch.no_grad():
         for data, target in tqdm(dataloader, desc="Evaluating", leave=False):
@@ -134,21 +135,66 @@ def evaluate(model, dataloader, criterion, device):
             loss = criterion(logits, target)
             total_loss += loss.item()
             
+            # Probabilities for AUC/AUROC
+            probs = torch.softmax(logits, dim=1)
+            all_probs.extend(probs.cpu().numpy())
+            
             _, predicted = torch.max(logits.data, 1)
             all_preds.extend(predicted.cpu().numpy())
             all_targets.extend(target.cpu().numpy())
             
+    acc = accuracy_score(all_targets, all_preds)
     bacc = balanced_accuracy_score(all_targets, all_preds)
-    f1 = f1_score(all_targets, all_preds, average='weighted')
-    return total_loss / len(dataloader), bacc, f1
+    # Explicitly provide labels to ensure consistent behavior, though 'weighted' ignores missing classes (weight=0)
+    # TUEV has 6 classes (0-5)
+    f1 = f1_score(all_targets, all_preds, average='weighted', labels=list(range(6)), zero_division=0)
+    
+    # AUROC and AUC-PR
+    try:
+        all_targets_np = np.array(all_targets)
+        all_probs_np = np.array(all_probs)
+        n_classes = all_probs_np.shape[1]
+        
+        if n_classes == 2:
+            # Binary case
+            auroc = roc_auc_score(all_targets_np, all_probs_np[:, 1])
+            auc_pr = average_precision_score(all_targets_np, all_probs_np[:, 1])
+        else:
+            # Multiclass case
+            # Binarize labels for AUC-PR
+            # Handle missing classes in y_true by explicit classes list if known, 
+            # but here we rely on what's present or try/except.
+            # label_binarize needs to know all possible classes to make columns match probs
+            # We assume classes are 0..n_classes-1
+            y_true_bin = label_binarize(all_targets_np, classes=range(n_classes))
+            
+            # multi_class='ovr' handles missing classes in y_true gracefully usually,
+            # but 'weighted' average might warn if a class is totally missing.
+            auroc = roc_auc_score(all_targets_np, all_probs_np, multi_class='ovr', average='macro')
+            auc_pr = average_precision_score(y_true_bin, all_probs_np, average='macro')
+            
+    except Exception as e:
+        # print(f"Metric Error: {e}")
+        auroc = float('nan')
+        auc_pr = float('nan')
+        
+    return {
+        "loss": total_loss / len(dataloader), 
+        "acc": acc,
+        "bacc": bacc, 
+        "f1": f1,
+        "auroc": auroc,
+        "auc_pr": auc_pr
+    }
 
 def main():
     parser = argparse.ArgumentParser()
     # CHANGED: default config to tuev
     parser.add_argument('--config', type=str, default='configs/finetune_tuev.yaml')
-    parser.add_argument('--baseline_path', type=str, required=True)
-    parser.add_argument('--flagship_path', type=str, required=True)
-    parser.add_argument('--featonly_path', type=str, required=True)
+    parser.add_argument('--baseline_path', type=str, default=None)
+    parser.add_argument('--flagship_path', type=str, default=None)
+    parser.add_argument('--featonly_path', type=str, default=None)
+    parser.add_argument('--run_models', type=str, nargs='+', default=['Baseline', 'Flagship', 'FeatOnly'], help='Models to run')
     # CHANGED: default dataset dir to TUEV path
     parser.add_argument('--dataset_dir', type=str, default='/vePFS-0x0d/pretrain-clip/benchmark_dataloader/hdf5_output/TUH_Events')
     # CHANGED: default output dir
@@ -223,12 +269,9 @@ def main():
             
         print(f"\n=== Ratio: {ratio_display} ({n_subs} Subjects) ===")
         
-        # Split 60/20/20 for TUEV (or use args)
-        # We follow the standard TUEV split logic roughly here, but since we are doing
-        # ratio-based scaling, we'll just split the currently selected subjects.
-        # Let's use 60% Train, 20% Val, 20% Test of the selected subset.
-        n_train = int(0.6 * n_subs)
-        n_val = int(0.2 * n_subs)
+        # Split 80/10/10 for TUEV (Full FT Standard)
+        n_train = int(0.8 * n_subs)
+        n_val = int(0.1 * n_subs)
         
         if n_train == 0: n_train = 1
         if n_val == 0 and n_subs > 1: n_val = 1
@@ -259,16 +302,30 @@ def main():
         val_dataset = TUEVDataset(val_files_subset) if val_files_subset else None
         test_dataset = TUEVDataset(test_files_subset) if test_files_subset else None
         
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, persistent_workers=True, prefetch_factor=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True, prefetch_factor=4, pin_memory=True) if val_dataset else None
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=True, prefetch_factor=4, pin_memory=True) if test_dataset else None
+        # Prepare DataLoaders
+        pf = 4 if args.num_workers > 0 else None
+        persistent = (args.num_workers > 0)
+        
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, persistent_workers=persistent, prefetch_factor=pf, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=persistent, prefetch_factor=pf, pin_memory=True) if val_dataset else None
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, persistent_workers=persistent, prefetch_factor=pf, pin_memory=True) if test_dataset else None
         
         # Define Models to Run
-        models_to_run = [
-            ('Baseline', args.baseline_path),
-            ('Flagship', args.flagship_path),
-            ('FeatOnly', args.featonly_path)
-        ]
+        available_models = {
+            'Baseline': args.baseline_path,
+            'Flagship': args.flagship_path,
+            'FeatOnly': args.featonly_path
+        }
+        
+        models_to_run = []
+        for m_name in args.run_models:
+            if m_name not in available_models:
+                print(f"Warning: Model {m_name} not known. Skipping.")
+                continue
+            p = available_models[m_name]
+            if p is None:
+                raise ValueError(f"Path for model '{m_name}' was not provided.")
+            models_to_run.append((m_name, p))
         
         for model_name, weights_path in models_to_run:
             print(f"--- Training {model_name} ---")
@@ -278,89 +335,89 @@ def main():
             setup_logger(args.output_dir, log_filename)
             logging.info(f"Starting training for model: {model_name}, Ratio: {ratio_display}")
             
+            # Configure Head Type
+            current_config = base_config.copy()
+            current_config['model'] = base_config['model'].copy()
+            
+            if model_name == 'FeatOnly':
+                current_config['model']['head_type'] = 'feat_cross_attn'
+            elif model_name == 'Flagship':
+                current_config['model']['head_type'] = 'flagship_concat'
+            else:
+                current_config['model']['head_type'] = 'pooling' # Default Baseline
+            
             # Reset Model for each run
-            model = load_pretrained_model(base_config, weights_path, device)
+            model = load_pretrained_model(current_config, weights_path, device)
             
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
             criterion = nn.CrossEntropyLoss()
             
             best_val_bacc = 0.0
-            best_val_f1 = 0.0
-            best_epoch = -1
             
-            # Path to save best model
-            best_model_path = os.path.join(args.output_dir, f"best_model_{model_name}_{ratio_display.replace('%','')}.pth")
+            epoch_results = []
             
             # Training Loop
-            scaler = GradScaler()
+            scaler = torch.amp.GradScaler('cuda')
             
             for epoch in range(args.epochs):
                 train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
                 
                 # Validate
+                val_stats = {"loss": float("nan"), "acc": float("nan"), "bacc": float("nan"), "f1": float("nan"), "auroc": float("nan"), "auc_pr": float("nan")}
                 if val_loader:
-                    val_loss, val_bacc, val_f1 = evaluate(model, val_loader, criterion, device)
+                    val_stats = evaluate(model, val_loader, criterion, device)
                     
-                    if val_bacc > best_val_bacc:
-                        best_val_bacc = val_bacc
-                        best_val_f1 = val_f1
-                        best_epoch = epoch
-                        # Save best model
-                        torch.save(model.state_dict(), best_model_path)
+                    if val_stats['bacc'] > best_val_bacc:
+                        best_val_bacc = val_stats['bacc']
                         
-                    log_msg = f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} BAcc: {val_bacc:.4f} F1: {val_f1:.4f} (Best BAcc: {best_val_bacc:.4f})"
-                else:
-                    log_msg = f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | No Validation Set"
-                    
+                # Test every epoch
+                test_stats = {"loss": float("nan"), "acc": float("nan"), "bacc": float("nan"), "f1": float("nan"), "auroc": float("nan"), "auc_pr": float("nan")}
+                if test_loader:
+                    test_stats = evaluate(model, test_loader, criterion, device)
+
+                log_msg = (f"Epoch {epoch+1}/{args.epochs} | "
+                           f"Train Loss: {train_loss:.4f} | "
+                           f"Val BAcc: {val_stats['bacc']:.4f} F1: {val_stats['f1']:.4f} AUROC: {val_stats['auroc']:.4f} | "
+                           f"Test BAcc: {test_stats['bacc']:.4f} F1: {test_stats['f1']:.4f} AUROC: {test_stats['auroc']:.4f}")
                 print(log_msg)
                 logging.info(log_msg)
                 
-            # Testing
-            final_test_bacc = 0.0
-            final_test_f1 = 0.0
-            
-            if test_loader and os.path.exists(best_model_path):
-                print(f"Loading best model from epoch {best_epoch+1} for testing...")
-                model.load_state_dict(torch.load(best_model_path))
-                test_loss, test_bacc, test_f1 = evaluate(model, test_loader, criterion, device)
-                final_test_bacc = test_bacc
-                final_test_f1 = test_f1
-                print(f"TEST RESULTS: Loss: {test_loss:.4f} BAcc: {test_bacc:.4f} F1: {test_f1:.4f}")
-                logging.info(f"TEST RESULTS: Loss: {test_loss:.4f} BAcc: {test_bacc:.4f} F1: {test_f1:.4f}")
-            elif test_loader:
-                print("Warning: No best model saved (maybe validation failed?), testing with last model.")
-                test_loss, test_bacc, test_f1 = evaluate(model, test_loader, criterion, device)
-                final_test_bacc = test_bacc
-                final_test_f1 = test_f1
-            else:
-                print("No test set available.")
+                epoch_results.append({
+                    "epoch": epoch + 1,
+                    "train": {"loss": train_loss, "acc": train_acc},
+                    "val": val_stats,
+                    "test": test_stats
+                })
             
             results.append({
                 'ratio': ratio_display,
                 'n_subs': n_subs,
                 'model': model_name,
-                'val_bacc': best_val_bacc,
-                'test_bacc': final_test_bacc,
-                'test_f1': final_test_f1
+                'best_val_bacc': best_val_bacc,
+                'epoch_history': epoch_results
             })
-            
-            print(f"Final Test BAcc for {model_name} @ {ratio_display}: {final_test_bacc*100:.2f}%, F1: {final_test_f1*100:.2f}%")
 
     # Generate Report
     print("\n=== Final Results Summary ===")
-    print(f"| {'Ratio':<8} | {'NumSub':<6} | {'Model':<10} | {'Test BAcc':<10} | {'Test F1':<10} |")
-    print(f"|{'-'*10}|{'-'*8}|{'-'*12}|{'-'*12}|{'-'*12}|")
     
     report_path = os.path.join(args.output_dir, 'results_final_ft.md')
     with open(report_path, 'w') as f:
-        f.write("# TUEV Full Fine-tuning Comparative Results\n\n")
-        f.write(f"| Ratio | NumSub | Model | Test BAcc (%) | Test F1 (%) | Val Best BAcc (%) |\n")
-        f.write(f"|-------|--------|-------|---------------|-------------|-------------------|\n")
+        f.write("# TUEV Full Fine-tuning Comparative Results (80/10/10 Split)\n\n")
+        f.write(f"| Ratio | NumSub | Model | Best Val BAcc (%) |\n")
+        f.write(f"|-------|--------|-------|-------------------|\n")
         
         for r in results:
-            line = f"| {r['ratio']} | {r['n_subs']} | {r['model']} | {r['test_bacc']*100:.2f} | {r['test_f1']*100:.2f} | {r['val_bacc']*100:.2f} |"
-            print(f"| {r['ratio']:<8} | {r['n_subs']:<6} | {r['model']:<10} | {r['test_bacc']*100:.2f}%    | {r['test_f1']*100:.2f}%    |")
-            f.write(line + "\n")
+            f.write(f"| {r['ratio']} | {r['n_subs']} | {r['model']} | {r['best_val_bacc']*100:.2f} |\n")
+        
+        f.write("\n\n# Detailed Epoch History\n")
+        for r in results:
+            f.write(f"\n## {r['model']} (Ratio: {r['ratio']})\n")
+            f.write("| Epoch | Train Loss | Val BAcc | Val F1 | Val AUROC | Val AUC-PR | Test BAcc | Test F1 | Test AUROC | Test AUC-PR |\n")
+            f.write("|-------|------------|----------|--------|-----------|------------|-----------|---------|------------|-------------|\n")
+            for ep in r['epoch_history']:
+                f.write(f"| {ep['epoch']} | {ep['train']['loss']:.4f} | "
+                        f"{ep['val']['bacc']:.4f} | {ep['val']['f1']:.4f} | {ep['val']['auroc']:.4f} | {ep['val']['auc_pr']:.4f} | "
+                        f"{ep['test']['bacc']:.4f} | {ep['test']['f1']:.4f} | {ep['test']['auroc']:.4f} | {ep['test']['auc_pr']:.4f} |\n")
             
     print(f"\nReport saved to {report_path}")
 

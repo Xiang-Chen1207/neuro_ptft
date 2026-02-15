@@ -1,5 +1,5 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export WANDB_MODE=disabled
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Ablation B: Feature Prediction Only (Sanity Check)
@@ -36,10 +36,10 @@ python3 main.py \
     output_dir=$OUTPUT_DIR \
     enable_wandb=true \
     project="ptft-sanity"\
-    epochs=30 \
-    dataset.batch_size=512 \
+    epochs=50\
+    dataset.batch_size=400 \
     dataset.input_size=12000 \
-    optimizer.lr=5e-5 \
+    optimizer.lr=3e-4 \
     val_freq_split=10 \
     model.seq_len=60 \
     dataset.num_workers=16 \

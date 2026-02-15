@@ -1,0 +1,61 @@
+
+task_type: pretraining
+output_dir: output/pretrain_st_eegformer
+device: cuda
+epochs: 100
+clip_grad: 1.0
+metric_key: loss
+val_freq_split: 5
+
+enable_wandb: true
+project: "eeg-knowledge-engine"
+entity: "bci-foundation-model"
+
+dataset:
+  name: JOINT
+  data_csv: datasets/data.csv
+  seed: 42
+  batch_size: 128
+  num_workers: 8
+  cache_path: output/pretrain_st_eegformer/dataset_index.json
+  # Feature path for optional feature prediction (not used in pure reconstruction)
+  feature_path: '/vePFS-0x0d/pretrain-clip/feature_analysis/features_final_zscore.csv'
+
+model:
+  name: st_eegformer
+  use_pretrained: false
+  
+  # Input Specs (Based on current dataset)
+  in_dim: 200       # Patch Size (12000 / 60)
+  seq_len: 60       # Number of temporal patches
+  
+  # Encoder (Small)
+  d_model: 384
+  n_layer: 8
+  nhead: 8
+  mlp_ratio: 4
+  dropout: 0.0
+  
+  # Decoder
+  decoder_depth: 4
+  decoder_embed_dim: 384
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4
+  
+  # Task
+  pretrain_tasks: ['reconstruction']
+  out_dim: 200 # Reconstruction dim = Patch Size
+
+loss:
+  name: mse
+  feature_loss_weight: 1.0
+  
+optimizer:
+  name: AdamW
+  lr: 0.0003 # 3e-4 from paper
+  weight_decay: 0.05
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 100
+  eta_min: 1.0e-6

@@ -3,18 +3,22 @@ set -e
 source /vePFS-0x0d/home/cx/miniconda3/bin/activate labram
 export PTFT_DATASET="TUAB"
 # Restrict to GPUs with available memory (0 and 1 have some space, 2 and 3 are full)
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+# Seeds
+SPLIT_SEED=7
+TRAIN_SEED=7
 
 # Paths
 BASELINE_WEIGHTS="/vePFS-0x0d/home/chen/related_projects/CBraMod/pretrained_weights/pretrained_weights.pth"
-FLAGSHIP_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/flagship_fixed/checkpoint_epoch_16.pth"
-FEATONLY_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/sanity_feat_only_all_60s/checkpoint_epoch_27.pth" # Assuming relative path works or fix it if needed
+FLAGSHIP_WEIGHTS="/vePFS-0x0d/home/cx/ptft/output_old/flagship_cross_attn/checkpoint_epoch_6.pth"
+FEATONLY_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/sanity_feat_only_all_60s/checkpoint_epoch_25.pth"
 
 BASELINE_FEAT="experiments/tuab_lp/features/recon_features.npz"
 FLAGSHIP_FEAT="experiments/tuab_lp/features/neuro_ke_features.npz"
 FEATONLY_FEAT="experiments/tuab_lp_feat_only/features/feat_only_features.npz"
 
-OUTPUT_REPORT="experiments/tuab_lp/results_final.md"
+OUTPUT_REPORT="experiments/tuab_lp/final.md"
 
 echo "=== Starting Full Comparative Experiment (Baseline vs Flagship vs FeatOnly) ==="
 
@@ -50,7 +54,8 @@ python experiments/tuab_lp/run_lp_compare.py \
     --baseline_path "$BASELINE_FEAT" \
     --flagship_path "$FLAGSHIP_FEAT" \
     --featonly_path "$FEATONLY_FEAT" \
-    --seed 42 \
+    --split_seed "$SPLIT_SEED" \
+    --train_seed "$TRAIN_SEED" \
     | tee "$OUTPUT_REPORT"
 
 echo "Done. Final results saved to $OUTPUT_REPORT"

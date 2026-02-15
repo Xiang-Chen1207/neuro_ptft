@@ -11,14 +11,14 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 #FLAGSHIP_WEIGHTS="/vePFS-0x0d/home/cx/ptft/output_old/flagship_cross_attn/checkpoint_epoch_6.pth"
 #FEATONLY_WEIGHTS="/vePFS-0x0d/home/cx/ptft/output_old/sanity_feat_only/checkpoint_epoch_5.pth"
 BASELINE_WEIGHTS="/vePFS-0x0d/home/chen/related_projects/CBraMod/pretrained_weights/pretrained_weights.pth"
-FLAGSHIP_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/flagship_fixed/checkpoint_epoch_16.pth"
-FEATONLY_WEIGHTS="/vepfs-0x0d/home/cx/ptft/output/sanity_feat_only_all_60s/checkpoint_epoch_27.pth"
+FLAGSHIP_WEIGHTS="/vePFS-0x0d/home/cx/ptft/output_old/flagship_cross_attn/checkpoint_epoch_6.pth"
+FEATONLY_WEIGHTS="/vePFS-0x0d/home/cx/ptft/output_old/sanity_feat_only_all_60s/checkpoint_epoch_25.pth"
 # CHANGED: paths to TUEV directories
 BASELINE_FEAT="experiments/tuev_lp/features/recon_features.npz"
 FLAGSHIP_FEAT="experiments/tuev_lp/features/neuro_ke_features.npz"
 FEATONLY_FEAT="experiments/tuev_lp_feat_only/features/feat_only_features.npz"
 
-OUTPUT_REPORT="experiments/tuev_lp/results_final_new.md"
+OUTPUT_REPORT="experiments/tuev_lp/final.md"
 # CHANGED: dataset dir
 DATASET_DIR="/vePFS-0x0d/pretrain-clip/benchmark_dataloader/hdf5_output/TUH_Events"
 

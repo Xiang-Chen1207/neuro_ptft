@@ -22,11 +22,13 @@ class TransformerEncoder(nn.Module):
             src: Tensor,
             mask: Optional[Tensor] = None,
             src_key_padding_mask: Optional[Tensor] = None,
+            channel_mask: Optional[Tensor] = None,
+            time_mask: Optional[Tensor] = None,
             is_causal: Optional[bool] = None) -> Tensor:
 
         output = src
         for mod in self.layers:
-            output = mod(output, src_mask=mask)
+            output = mod(output, src_mask=mask, channel_mask=channel_mask, time_mask=time_mask)
         if self.norm is not None:
             output = self.norm(output)
         return output
@@ -84,29 +86,46 @@ class TransformerEncoderLayer(nn.Module):
             src: Tensor,
             src_mask: Optional[Tensor] = None,
             src_key_padding_mask: Optional[Tensor] = None,
+            channel_mask: Optional[Tensor] = None,
+            time_mask: Optional[Tensor] = None,
             is_causal: bool = False) -> Tensor:
 
         x = src
-        x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal)
+        x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, channel_mask, time_mask, is_causal=is_causal)
         x = x + self._ff_block(self.norm2(x))
         return x
 
     # self-attention block
     def _sa_block(self, x: Tensor,
-                  attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False) -> Tensor:
+                  attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], 
+                  channel_mask: Optional[Tensor] = None, time_mask: Optional[Tensor] = None,
+                  is_causal: bool = False) -> Tensor:
         bz, ch_num, patch_num, patch_size = x.shape
         xs = x[:, :, :, :patch_size // 2]
         xt = x[:, :, :, patch_size // 2:]
         xs = xs.transpose(1, 2).contiguous().view(bz*patch_num, ch_num, patch_size // 2)
         xt = xt.contiguous().view(bz*ch_num, patch_num, patch_size // 2)
+
+        # Prepare masks
+        # key_padding_mask was the old way, now we prefer channel_mask and time_mask
+        mask_s = None
+        if channel_mask is not None:
+            # channel_mask: (B, C) -> (B*P, C)
+            mask_s = channel_mask.unsqueeze(1).expand(-1, patch_num, -1).reshape(bz * patch_num, ch_num)
+        
+        mask_t = None
+        if time_mask is not None:
+            # time_mask: (B, T) -> (B*C, T)
+            mask_t = time_mask.unsqueeze(1).expand(-1, ch_num, -1).reshape(bz * ch_num, patch_num)
+
         xs = self.self_attn_s(xs, xs, xs,
                              attn_mask=attn_mask,
-                             key_padding_mask=key_padding_mask,
+                             key_padding_mask=mask_s if mask_s is not None else key_padding_mask,
                              need_weights=False)[0]
         xs = xs.contiguous().view(bz, patch_num, ch_num, patch_size//2).transpose(1, 2)
         xt = self.self_attn_t(xt, xt, xt,
                               attn_mask=attn_mask,
-                              key_padding_mask=key_padding_mask,
+                              key_padding_mask=mask_t if mask_t is not None else key_padding_mask,
                               need_weights=False)[0]
         xt = xt.contiguous().view(bz, ch_num, patch_num, patch_size//2)
         x = torch.concat((xs, xt), dim=3)

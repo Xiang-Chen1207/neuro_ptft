@@ -7,6 +7,9 @@ import yaml
 import os
 from tqdm import tqdm
 from pathlib import Path
+from scipy.stats import gaussian_kde
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Add project root to path
 import sys
@@ -15,6 +18,258 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models.wrapper import CBraModWrapper
 from datasets.builder import build_dataloader
 import utils.util as utils
+
+def get_feature_category(feature_name):
+    name = feature_name.lower()
+    if 'ratio' in name: return 'Ratios'
+    if any(k in name for k in ['aperiodic', 'spectral', 'peak_frequency', 'individual_alpha']): return 'Structure'
+    if any(k in name for k in ['power', 'alpha', 'beta', 'delta', 'theta', 'gamma']): return 'Power'
+    return 'Time'
+
+def plot_density_scatter(ax, y_true, y_pred, title, r2, pcc, cmap='mako'):
+    # Subsample for KDE speed if needed
+    if len(y_true) > 5000:
+        idx = np.random.choice(len(y_true), 5000, replace=False)
+        x_kde = y_true[idx]
+        y_kde = y_pred[idx]
+    else:
+        x_kde, y_kde = y_true, y_pred
+        
+    xy = np.vstack([x_kde, y_kde])
+    z = gaussian_kde(xy)(xy)
+    idx = z.argsort()
+    x, y, z = x_kde[idx], y_kde[idx], z[idx]
+    
+    # Use mako as requested (Blue-Green-Black)
+    # ADJUSTED: Reduced alpha and size to prevent "black blob" effect on dense real data
+    # rasterized=True is CRITICAL for PDF export with many points (keeps file size small and fast)
+    ax.scatter(x, y, c=z, s=8, cmap='mako', edgecolor='none', alpha=0.6, rasterized=True)
+    
+    # Diagonal
+    lims = [np.min([ax.get_xlim(), ax.get_ylim()]), np.max([ax.get_xlim(), ax.get_ylim()])]
+    ax.plot(lims, lims, color='#333333', linestyle='--', lw=1, alpha=0.6)
+    
+    ax.set_title(title, fontsize=10, fontweight='bold')
+    
+    # Stats box
+    stats_text = f"$R^2={r2:.2f}$\n$r={pcc:.2f}$"
+    ax.text(0.05, 0.95, stats_text, transform=ax.transAxes,
+            va='top', ha='left', fontsize=9, fontweight='medium',
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='#dddddd', alpha=0.9))
+
+def generate_combined_figure(df, all_preds, all_targets, feature_names, output_path, figsize=(12, 8)):
+    # ICML Style
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'axes.spines.top': False,
+        'axes.spines.right': False
+    })
+    
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.2, 0.8])
+    
+    # --- LEFT: 2x2 Best Features ---
+    df = df.copy() # Avoid modifying original
+    df['Category'] = df['Feature Name'].apply(get_feature_category)
+    
+    # Define Explicit Order: Time -> Power -> Structure -> Ratios
+    cat_order_list = ['Time', 'Power', 'Structure', 'Ratios']
+    
+    gs_left = gs[:, 0].subgridspec(2, 2, wspace=0.3, hspace=0.3)
+    
+    # Find best features and Plot Scatters in fixed order
+    for i, cat in enumerate(cat_order_list):
+        cat_df = df[df['Category'] == cat]
+        if cat_df.empty: continue
+        
+        best_row = cat_df.loc[cat_df['R2'].idxmax()]
+        feat_idx = best_row['Feature Index']
+        feat_name = best_row['Feature Name']
+        
+        ax = fig.add_subplot(gs_left[i//2, i%2])
+        
+        y_true = all_targets[:, feat_idx]
+        y_pred = all_preds[:, feat_idx]
+        
+        plot_density_scatter(ax, y_true, y_pred, f"{cat}: {feat_name}", best_row['R2'], best_row['PCC'])
+        
+        if i%2 == 0: ax.set_ylabel("Predicted")
+        if i//2 == 1: ax.set_xlabel("True")
+        
+    # --- RIGHT: Bar Chart (Style 2 Cool Categorical) ---
+    ax_right = fig.add_subplot(gs[:, 1])
+    
+    # Sort Logic for Bar Chart:
+    # 1. Category Order: Ratios -> Structure -> Power -> Time (Reverse for barh so Time is Top)
+    # 2. Within Category: R2 Ascending (Small -> Large) so Largest R2 is Top
+    
+    cat_dtype = pd.CategoricalDtype(categories=cat_order_list[::-1], ordered=True)
+    df['Category'] = df['Category'].astype(cat_dtype)
+    
+    df_sorted = df.sort_values(by=['Category', 'R2'], ascending=[True, True])
+    
+    pal = {
+        'Time': '#4c78a8', # Steel Blue
+        'Power': '#72b7b2', # Teal
+        'Structure': '#b279a2', # Muted Purple
+        'Ratios': '#54a24b'  # Muted Green
+    }
+    
+    colors = [pal.get(c, '#888888') for c in df_sorted['Category']]
+    
+    bars = ax_right.barh(np.arange(len(df)), df_sorted['R2'], color=colors, height=0.8, alpha=0.9)
+    
+    # Separators
+    df_reset = df_sorted.reset_index(drop=True)
+    current_cat = None
+    for i in range(len(df_reset)):
+        cat = df_reset.loc[i, 'Category']
+        if current_cat is not None and cat != current_cat:
+            ax_right.axhline(i - 0.5, color='white', linestyle='-', linewidth=2, alpha=1.0)
+        current_cat = cat
+        
+    ax_right.set_yticks([])
+    ax_right.set_xlabel("R2 Score", fontsize=11, fontweight='bold')
+    
+    # NEW: Set X-axis to 1.0 and add vertical line
+    ax_right.set_xlim(0, 1.05)
+    ax_right.axvline(1.0, color='gray', linestyle='--', linewidth=1.0, alpha=0.7)
+    
+    # Legend on Top
+    # Order: Time -> Power -> Structure -> Ratios
+    handles = [plt.Rectangle((0,0),1,1, color=pal[c]) for c in cat_order_list if c in pal]
+    
+    # Align legend with left title
+    ax_right.legend(handles, [c for c in cat_order_list if c in pal], 
+              loc='lower center', bbox_to_anchor=(0.5, 1.02), 
+              ncol=4, frameon=False, fontsize=9)
+    
+    sns.despine(ax=ax_right, left=True)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def save_top_features_data(df, all_preds, all_targets, output_path):
+    """Save data for top features to NPZ for quick replotting."""
+    categories = ['Time', 'Power', 'Structure', 'Ratios']
+    data_dict = {}
+    
+    df['Category'] = df['Feature Name'].apply(get_feature_category)
+    
+    for cat in categories:
+        cat_df = df[df['Category'] == cat]
+        if cat_df.empty: continue
+        best_row = cat_df.loc[cat_df['R2'].idxmax()]
+        feat_idx = best_row['Feature Index']
+        feat_name = best_row['Feature Name']
+        
+        data_dict[f"{cat}_name"] = feat_name
+        data_dict[f"{cat}_r2"] = best_row['R2']
+        data_dict[f"{cat}_pcc"] = best_row['PCC']
+        data_dict[f"{cat}_true"] = all_targets[:, feat_idx]
+        data_dict[f"{cat}_pred"] = all_preds[:, feat_idx]
+        
+    np.savez(output_path, **data_dict)
+    print(f"Top features data saved to {output_path}")
+
+def generate_full_grid_figure(df, all_preds, all_targets, feature_names, output_path):
+    """
+    Generate a single 8x8 grid figure directly using matplotlib.
+    Minimalist style: Only Feature Name (Large), no ticks, no stats.
+    """
+    print("Generating 8x8 Full Grid Figure (Direct)...")
+    
+    # Sort features by Category then R2
+    df_grid = df.copy()
+    df_grid['Category'] = df_grid['Feature Name'].apply(get_feature_category)
+    cat_order = {'Time': 0, 'Power': 1, 'Structure': 2, 'Ratios': 3}
+    df_grid['CatOrder'] = df_grid['Category'].map(cat_order)
+    df_grid = df_grid.sort_values(by=['CatOrder', 'R2'], ascending=[True, False])
+    
+    ordered_indices = df_grid['Feature Index'].values
+    ordered_names = df_grid['Feature Name'].values
+    
+    # Layout: 8x8
+    ROWS = 8
+    COLS = 8
+    
+    # Large Figure Size
+    # A4 is ~8x11. We want 8x8 squares.
+    # Let's make it 16x16 inches for high detail source
+    fig, axes = plt.subplots(ROWS, COLS, figsize=(20, 24))
+    axes = axes.flatten()
+    
+    # Adjust spacing: Close packing
+    plt.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.02, wspace=0.1, hspace=0.3)
+    
+    for i in tqdm(range(len(axes)), desc="Plotting Grid"):
+        ax = axes[i]
+        
+        if i < len(ordered_indices):
+            feat_idx = ordered_indices[i]
+            fname = ordered_names[i]
+            
+            y_true = all_targets[:, feat_idx]
+            y_pred = all_preds[:, feat_idx]
+            
+            # Subsample for KDE speed if needed (keep 5000 for quality)
+            if len(y_true) > 5000:
+                idx_sub = np.random.choice(len(y_true), 5000, replace=False)
+                x_kde, y_kde = y_true[idx_sub], y_pred[idx_sub]
+            else:
+                x_kde, y_kde = y_true, y_pred
+            
+            # Calculate Density
+            try:
+                xy = np.vstack([x_kde, y_kde])
+                z = gaussian_kde(xy)(xy)
+                idx_sort = z.argsort()
+                x_plot, y_plot, z_plot = x_kde[idx_sort], y_kde[idx_sort], z[idx_sort]
+            except:
+                # Fallback if KDE fails (e.g. constant value)
+                x_plot, y_plot = x_kde, y_kde
+                z_plot = 'blue'
+            
+            # Scatter (Rasterized)
+            # Increased s slightly for visibility in grid
+            ax.scatter(x_plot, y_plot, c=z_plot, s=10, cmap='mako', edgecolor='none', alpha=0.6, rasterized=True)
+            
+            # Diagonal
+            lims = [-3, 3]
+            ax.plot(lims, lims, color='#333333', linestyle='--', lw=1, alpha=0.5)
+            ax.set_xlim(-4, 4)
+            ax.set_ylim(-4, 4)
+            
+            # Clean up
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.axis('on') # Keep box border
+            
+            # Title: Feature Name only
+            # Split long names
+            short_name = fname
+            if len(short_name) > 20: # Aggressive splitting
+                 parts = short_name.split('_')
+                 # Try to split into 2 or 3 lines if very long
+                 if len(parts) >= 4:
+                     # 3 lines max
+                     chunk = len(parts)//2
+                     short_name = "_".join(parts[:chunk]) + "\n" + "_".join(parts[chunk:])
+                 else:
+                     mid = len(parts)//2
+                     short_name = "_".join(parts[:mid]) + "\n" + "_".join(parts[mid:])
+            
+            # Reduce font size to prevent overlap
+            # User requested larger font now that wrapping is better
+            ax.set_title(short_name, fontsize=12, fontweight='bold', pad=3)
+            
+        else:
+            ax.axis('off')
+            
+    # Save
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Feature Prediction Metrics")
@@ -124,11 +379,55 @@ def main():
     
     with torch.no_grad():
         for batch in tqdm(val_loader):
-            if len(batch) == 2:
-                x, y = batch
-                mask = None
+            if isinstance(batch, dict):
+                # Handle dictionary batch
+                if 'eeg' in batch:
+                    x = batch['eeg']
+                elif 'input' in batch:
+                    x = batch['input']
+                elif 'x' in batch:
+                    x = batch['x']
+                else:
+                    # Try to find the input tensor
+                    for k, v in batch.items():
+                         if isinstance(v, torch.Tensor) and v.ndim >= 3:
+                             x = v
+                             break
+                
+                if 'features' in batch:
+                    y = batch['features']
+                elif 'target' in batch:
+                    y = batch['target']
+                elif 'label' in batch:
+                    y = batch['label']
+                elif 'y' in batch:
+                    y = batch['y']
+                else:
+                    # Fallback: assume second item in items list if it's a tensor
+                    # Or check for 'feature_label'
+                    if 'feature_label' in batch:
+                         y = batch['feature_label']
+                    else:
+                         print(f"Warning: Could not find target features in batch keys: {batch.keys()}")
+                         continue
+                    
+                mask = batch.get('mask', None)
+                
+            elif isinstance(batch, (list, tuple)):
+                if len(batch) == 2:
+                    x, y = batch
+                    mask = None
+                elif len(batch) == 3:
+                    x, y, mask = batch
+                else:
+                    # Handle cases with more items (e.g., filename, index, etc.)
+                    # Assume first 3 are x, y, mask
+                    x = batch[0]
+                    y = batch[1]
+                    mask = batch[2]
             else:
-                x, y, mask = batch
+                print(f"Unknown batch type: {type(batch)}")
+                continue
             
             x = x.to(args.device).float()
             
@@ -290,21 +589,15 @@ def main():
     print("Top 10 Features by R2:")
     print(df.head(10))
 
-    # --- Generate Scatter Plots ---
-    print("Generating Scatter Plots and Radar Charts...")
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    import numpy as np
-    from math import pi
-
+    # --- Generate Visualizations ---
+    print("Generating Visualizations...")
+    
     output_dir = os.path.dirname(args.output)
     if not output_dir:
         output_dir = "."
-
-    # Create a unique visualization directory based on the output CSV filename
+    
     output_stem = os.path.splitext(os.path.basename(args.output))[0]
     viz_base_dir = os.path.join(output_dir, f"{output_stem}_viz")
-    
     scatter_dir = os.path.join(viz_base_dir, "scatter_plots")
     os.makedirs(scatter_dir, exist_ok=True)
     
@@ -312,185 +605,73 @@ def main():
     all_preds_tensor = torch.cat(all_preds, dim=0) # (N, D)
     all_targets_tensor = torch.cat(all_targets, dim=0) # (N, D)
     
-    # Calculate per-sample MSE to find best/worst examples
-    # (N, D) -> (N,)
-    per_sample_mse = torch.mean((all_preds_tensor - all_targets_tensor)**2, dim=1)
+    all_preds_np = all_preds_tensor.cpu().numpy()
+    all_targets_np = all_targets_tensor.cpu().numpy()
     
-    # Select indices: Best 3, Median 1, Worst 1
-    sorted_indices = torch.argsort(per_sample_mse)
-    n_samples = len(sorted_indices)
+    # 1. Generate 62 Individual Scatter Plots (Density Style)
+    print(f"Generating {all_preds_np.shape[1]} individual scatter plots...")
+    num_features = all_preds_np.shape[1]
     
-    best_indices = sorted_indices[:3].cpu().numpy()
-    median_index = sorted_indices[n_samples // 2].cpu().numpy()
-    worst_index = sorted_indices[-1].cpu().numpy()
-    
-    indices_to_plot = np.concatenate([best_indices, [median_index]])
-    labels_to_plot = ["Best #1", "Best #2", "Best #3", "Median"]
-    
-    # Radar Chart Function
-    def plot_radar_chart(categories, values_list, labels_list, title, filename):
-        N = len(categories)
-        angles = [n / float(N) * 2 * pi for n in range(N)]
-        angles += angles[:1]
-        
-        fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-        
-        # Draw one axe per variable + add labels
-        plt.xticks(angles[:-1], categories, color='grey', size=8)
-        
-        # Draw ylabels
-        ax.set_rlabel_position(0)
-        # plt.yticks([10, 20, 30], ["10", "20", "30"], color="grey", size=7)
-        # plt.ylim(0, 40)
-        
-        colors = ['b', 'g', 'r', 'c', 'm', 'y']
-        
-        for i, (values, label) in enumerate(zip(values_list, labels_list)):
-            values = list(values)
-            values += values[:1]
-            ax.plot(angles, values, linewidth=1, linestyle='solid', label=label, color=colors[i % len(colors)])
-            ax.fill(angles, values, color=colors[i % len(colors)], alpha=0.1)
-            
-        plt.title(title, size=20, y=1.1)
-        plt.legend(loc='upper right', bbox_to_anchor=(0.1, 0.1))
-        
-        plt.tight_layout()
-        plt.savefig(filename, dpi=150)
-        plt.close()
-
-    # Normalize data for radar chart visualization?
-    # Z-scores are roughly -3 to 3. Shift them to be positive for radar chart area?
-    # Or just use raw values and set appropriate limits. 
-    # Radar charts with negative values are tricky. 
-    # Strategy: Min-Max normalize each feature based on the GLOBAL range of that feature in the dataset.
-    # This preserves relative magnitude.
-    
-    all_preds_np = all_preds_tensor.numpy()
-    all_targets_np = all_targets_tensor.numpy()
-    
-    feat_min = all_targets_np.min(axis=0)
-    feat_max = all_targets_np.max(axis=0)
-    feat_range = feat_max - feat_min
-    feat_range[feat_range == 0] = 1e-6
-    
-    # We will plot separate charts for different feature groups to avoid overcrowding
-    # Based on feature names
-    if feature_names:
-        groups = {
-            "Time & Complexity": [],
-            "Spectral Power": [],
-            "Relative Power": [],
-            "Spectral Features": []
-        }
-        
-        for idx, name in enumerate(feature_names):
-            if "relative_power" in name:
-                groups["Relative Power"].append(idx)
-            elif "power" in name and "relative" not in name and "ratio" not in name:
-                 groups["Spectral Power"].append(idx)
-            elif "spectral" in name or "frequency" in name or "ratio" in name or "exponent" in name:
-                groups["Spectral Features"].append(idx)
-            else:
-                groups["Time & Complexity"].append(idx)
-                
-        # Generate Radar Charts for selected samples
-        radar_dir = os.path.join(viz_base_dir, "radar_charts")
-        os.makedirs(radar_dir, exist_ok=True)
-        
-        for i, idx in enumerate(indices_to_plot):
-            sample_label = labels_to_plot[i]
-            sample_mse = per_sample_mse[idx].item()
-            
-            # Normalize this sample's target and pred
-            # But wait, we want to see if Pred matches Target.
-            # We should normalize BOTH using the Global Min/Max of Target (to keep scale consistent)
-            
-            target_raw = all_targets_np[idx]
-            pred_raw = all_preds_np[idx]
-            
-            # Plot for each group
-            for group_name, feat_indices in groups.items():
-                if not feat_indices:
-                    continue
-                    
-                cats = [feature_names[fi] for fi in feat_indices]
-                # Shorten names for display
-                short_cats = [c.replace('_mean', '').replace('_std', ' (std)').replace('mean_', '').replace('spectral_', '').replace('_power', '') for c in cats]
-                
-                # Extract values
-                t_vals = target_raw[feat_indices]
-                p_vals = pred_raw[feat_indices]
-                
-                # Normalize to [0, 1] for visualization using global min/max
-                mins = feat_min[feat_indices]
-                maxs = feat_max[feat_indices]
-                ranges = feat_range[feat_indices]
-                
-                t_norm = (t_vals - mins) / ranges
-                p_norm = (p_vals - mins) / ranges
-                
-                # Clip to [0, 1] just in case pred is out of bound
-                p_norm = np.clip(p_norm, 0, 1.2) # Allow slight overshoot
-                
-                # Also include the mean of all targets as a reference baseline?
-                # Maybe too cluttered. Just True vs Pred.
-                
-                fname = f"radar_{sample_label.replace(' ', '_')}_{group_name.replace(' ', '_')}.png"
-                fpath = os.path.join(radar_dir, fname)
-                
-                plot_radar_chart(
-                    short_cats, 
-                    [t_norm, p_norm], 
-                    ["Ground Truth", "Prediction"], 
-                    f"{sample_label} (MSE={sample_mse:.2f}) - {group_name}",
-                    fpath
-                )
-        
-        print(f"Radar charts saved to {radar_dir}/")
-
-    # Scatter Plots Logic (Keep existing)
-    all_preds = all_preds_np
-    all_targets = all_targets_np
-    
-    # Subsample for plotting if too large (e.g. max 5000 points)
-    num_samples = all_preds.shape[0]
-    if num_samples > 5000:
-        indices = np.random.choice(num_samples, 5000, replace=False)
-        plot_preds = all_preds[indices]
-        plot_targets = all_targets[indices]
-    else:
-        plot_preds = all_preds
-        plot_targets = all_targets
-        
-    num_features = all_preds.shape[1]
-    
-    for i in tqdm(range(num_features), desc="Plotting"):
+    for i in tqdm(range(num_features), desc="Plotting Scatters"):
         fname = feature_names[i] if feature_names else f"Feature {i}"
         safe_fname = fname.replace('/', '_').replace(' ', '_')
         
-        # Get metrics for title
         r2_val = r2_per_channel[i].item()
         pcc_val = pcc_per_channel[i].item()
         
         plt.figure(figsize=(6, 6))
-        # Scatter with alpha
-        plt.scatter(plot_targets[:, i], plot_preds[:, i], alpha=0.3, s=10, edgecolors='none')
+        ax = plt.gca()
         
-        # Identity line
-        min_val = min(plot_targets[:, i].min(), plot_preds[:, i].min())
-        max_val = max(plot_targets[:, i].max(), plot_preds[:, i].max())
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7)
+        y_true = all_targets_np[:, i]
+        y_pred = all_preds_np[:, i]
         
-        plt.title(f"{fname}\nR2={r2_val:.3f}, r={pcc_val:.3f}")
-        plt.xlabel("True Value (Z-scored)")
-        plt.ylabel("Predicted Value")
-        plt.grid(True, alpha=0.3)
+        plot_density_scatter(ax, y_true, y_pred, fname, r2_val, pcc_val)
+        
+        ax.set_xlabel("True Value (Z-scored)")
+        ax.set_ylabel("Predicted Value")
         plt.tight_layout()
         
-        plt.savefig(os.path.join(scatter_dir, f"{safe_fname}.png"), dpi=150)
+        # Save as PDF for high quality, but with rasterized scatter points
+        plt.savefig(os.path.join(scatter_dir, f"{safe_fname}.pdf"), dpi=300)
         plt.close()
         
-    print(f"Scatter plots saved to {scatter_dir}/")
+    print(f"Individual scatter plots saved to {scatter_dir}/")
+    
+    # 2. Generate Combined Summary Figure (3 Sizes)
+    print("Generating Combined Summary Figures (Small, Medium, Large)...")
+    
+    # Save Top Features Data for quick replotting
+    top_feats_path = os.path.join(viz_base_dir, "top_features_data.npz")
+    save_top_features_data(df, all_preds_np, all_targets_np, top_feats_path)
+    
+    # Large (Original)
+    combined_path_L = os.path.join(viz_base_dir, "combined_analysis_style2_L.png")
+    generate_combined_figure(df, all_preds_np, all_targets_np, feature_names, combined_path_L, figsize=(12, 8))
+    
+    # Medium (Standard Paper Width) -> Half Column optimized
+    # Half column width is typically 3.25 to 3.5 inches.
+    # If we make the figure smaller but keep font sizes, everything looks bigger.
+    # Previous M was (10, 6). Let's try (8, 5) or even smaller for half-column density.
+    # But user wants "canvas smaller so text is bigger".
+    # If we use figsize=(8, 5) and keep font sizes, it simulates a larger relative font.
+    combined_path_M = os.path.join(viz_base_dir, "combined_analysis_style2_M.png")
+    generate_combined_figure(df, all_preds_np, all_targets_np, feature_names, combined_path_M, figsize=(8, 5))
+    
+    # Small (Compact)
+    combined_path_S = os.path.join(viz_base_dir, "combined_analysis_style2_S.png")
+    generate_combined_figure(df, all_preds_np, all_targets_np, feature_names, combined_path_S, figsize=(8, 5))
+    
+    # 3. Generate 8x8 Grid PDF (Vector/Raster Hybrid)
+    print("Generating 8x8 Grid PDF (Appendix)...")
+    appendix_dir = os.path.join(viz_base_dir, "appendix")
+    os.makedirs(appendix_dir, exist_ok=True)
+    grid_pdf_path = os.path.join(appendix_dir, "appendix_scatter_grid_8x8.pdf")
+    
+    # Use the new direct generation function
+    generate_full_grid_figure(df, all_preds_np, all_targets_np, feature_names, grid_pdf_path)
+    
+    print(f"8x8 Grid PDF saved to {grid_pdf_path}")
+    print(f"Combined figures saved to {viz_base_dir}")
 
 if __name__ == "__main__":
     main()

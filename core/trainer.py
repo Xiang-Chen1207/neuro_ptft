@@ -19,6 +19,8 @@ class Trainer:
         self.model.to(self.device)
 
         if torch.cuda.device_count() > 1 and self.device.type == 'cuda':
+             if config.get('task_type') == 'pretraining' and config.get('model', {}).get('name') == 'eegmamba':
+                 self._warmup_eegmamba_kernels()
              print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
              self.model = torch.nn.DataParallel(self.model)
         
@@ -30,6 +32,41 @@ class Trainer:
         
         # Initialize WandB
         self.log_writer = WandbLogger(config)
+
+    def _warmup_eegmamba_kernels(self):
+        model_cfg = self.config.get('model', {})
+        dataset_cfg = self.config.get('dataset', {})
+        seq_len = int(model_cfg.get('seq_len', 60))
+        patch_size = int(model_cfg.get('in_dim', 200))
+        batch_size = int(min(2, dataset_cfg.get('batch_size', 2)))
+        ch_num = int(model_cfg.get('warmup_channels', 21))
+        
+        # Warmup only on the primary device. 
+        # Iterating over all devices in the same process can cause Triton context issues.
+        device = self.device
+        print(f"DEBUG: Warming up eegmamba kernels on {device}...")
+        
+        # Ensure model is on device (should be already)
+        self.model.to(device)
+        
+        x = torch.zeros(batch_size, ch_num, seq_len, patch_size, device=device, dtype=torch.float32)
+        mask = torch.zeros(batch_size, ch_num, seq_len, device=device, dtype=torch.float32)
+        
+        try:
+            out = self.model(x, mask=mask)
+            if isinstance(out, tuple):
+                out = out[0] if out[0] is not None else out[-1]
+            loss = out.float().mean()
+            loss.backward()
+            if hasattr(self.model, "zero_grad"):
+                self.model.zero_grad(set_to_none=True)
+            torch.cuda.synchronize(device)
+            print("DEBUG: Warmup successful.")
+        except Exception as e:
+            print(f"WARNING: Warmup failed with error: {e}. Proceeding anyway...")
+            
+        # Restore model to device (redundant if we didn't move it)
+        self.model.to(self.device)
         
     def _setup_optimizer(self):
         # Use copy() to avoid modifying original config (important for checkpoint saving)
