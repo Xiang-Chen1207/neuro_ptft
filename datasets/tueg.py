@@ -235,7 +235,10 @@ class TUEGDataset(Dataset):
         super().__init__()
         self.input_size = input_size
         self.transform = transform
+        self.required_num_channels = int(kwargs.get('required_num_channels', 21))
+        self.patch_size = int(kwargs.get('patch_size', 200))
         self.drop_bad_samples = bool(kwargs.get('drop_bad_samples', True))
+        self.norm_epsilon = float(kwargs.get('norm_epsilon', 1e-6))
         self.feature_clip_min = float(kwargs.get('feature_clip_min', -6.0))
         self.feature_clip_max = float(kwargs.get('feature_clip_max', 6.0))
         self.h5_rdcc_nbytes = int(kwargs.get('h5_rdcc_nbytes', 8 * 1024 * 1024))
@@ -542,12 +545,19 @@ class TUEGDataset(Dataset):
 
             shape = dset.shape
             
-            is_transposed = False
-            if len(shape) == 2 and shape[0] != 21 and shape[1] == 21:
+            if len(shape) != 2:
+                raise ValueError(f"Expected 2D EEG array, got shape={shape}")
+
+            if shape[0] == self.required_num_channels:
+                is_transposed = False
+                time_dim = 1
+            elif shape[1] == self.required_num_channels:
                 is_transposed = True
                 time_dim = 0
             else:
-                time_dim = 1
+                raise ValueError(
+                    f"Channel check failed (required={self.required_num_channels}): shape={shape}"
+                )
 
             current_len = shape[time_dim]
             
@@ -591,15 +601,16 @@ class TUEGDataset(Dataset):
 
         # Normalize using numpy (faster for small arrays)
         mean = data.mean(axis=1, keepdims=True)
-        std = data.std(axis=1, ddof=1, keepdims=True)
-        data = (data - mean) / (std + 1e-6)
+        std = data.std(axis=1, ddof=0, keepdims=True)
+        np.maximum(std, self.norm_epsilon, out=std)
+        np.subtract(data, mean, out=data)
+        data /= std
         
         tensor = torch.from_numpy(np.ascontiguousarray(data))
         
-        patch_size = 200
-        if self.input_size % patch_size == 0:
-            num_patches = self.input_size // patch_size
-            tensor = tensor.view(tensor.shape[0], num_patches, patch_size)
+        if self.input_size % self.patch_size == 0:
+            num_patches = self.input_size // self.patch_size
+            tensor = tensor.view(tensor.shape[0], num_patches, self.patch_size)
 
         if self.transform is not None:
             tensor = self.transform(tensor)

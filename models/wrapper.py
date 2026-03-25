@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from einops.layers.torch import Rearrange
 from .backbone import CBraModBackbone
+from .csbrain_backbone import CSBrainBackbone
 try:
     from .eegmamba import EEGMambaBackbone
 except ImportError:
@@ -85,6 +86,19 @@ class CBraModWrapper(nn.Module):
              if TeChBackbone is None:
                  raise ImportError("TeChBackbone could not be imported.")
              self.backbone = TeChBackbone(**model_config)
+        elif model_name == 'csbrain':
+             self.backbone = CSBrainBackbone(
+                in_dim=model_config.get('in_dim', 200),
+                out_dim=model_config.get('out_dim', 200),
+                d_model=model_config.get('d_model', 200),
+                dim_feedforward=model_config.get('dim_feedforward', 800),
+                seq_len=model_config.get('seq_len', 30),
+                n_layer=model_config.get('n_layer', 12),
+                nhead=model_config.get('nhead', 8),
+                num_channels=model_config.get('num_channels', 19),
+                brain_regions=model_config.get('brain_regions'),
+                sorted_indices=model_config.get('sorted_indices'),
+            )
         else:
             self.backbone = CBraModBackbone(
                 in_dim=model_config.get('in_dim', 200),
