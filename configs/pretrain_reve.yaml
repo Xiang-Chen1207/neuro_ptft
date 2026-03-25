@@ -1,0 +1,53 @@
+task_type: pretraining
+output_dir: output/pretrain_reve
+device: cuda
+epochs: 100
+clip_grad: 1.0
+metric_key: loss
+val_freq_split: 5
+
+# Logging
+enable_wandb: true
+project: "eeg-knowledge-engine"
+entity: "bci-foundation-model"
+
+dataset:
+  name: TUEG
+  dataset_dir: /vePFS-0x0d/pretrain-clip/output_tuh_full_pipeline/merged_final_dataset
+  seed: 42
+  batch_size: 128
+  num_workers: 8
+  cache_path: output/pretrain_reve/dataset_index.json
+  # feature_path: '/vePFS-0x0d/pretrain-clip/feature_analysis/features_final_zscore.csv'
+
+model:
+  name: reve
+  use_pretrained: false
+  in_dim: 200 # Patch Size
+  d_model: 512
+  dim_feedforward: 2048 # d_model * mlp_dim_ratio (4.0)
+  mlp_dim_ratio: 4.0
+  seq_len: 60 # Number of patches
+  n_layer: 12
+  nhead: 8
+  dropout: 0.1
+  freqs: 4
+  noise_ratio: 0.0025
+  patch_overlap: 0
+  
+  # --- Pretraining Tasks ---
+  pretrain_tasks: ['reconstruction']
+  
+loss:
+  name: mse
+  feature_loss_weight: 1.0
+  
+optimizer:
+  name: AdamW
+  lr: 0.001
+  weight_decay: 0.05
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 100
+  eta_min: 1.0e-6

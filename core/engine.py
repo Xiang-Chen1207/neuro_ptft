@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 import sys
+import time
 import numpy as np
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score, f1_score, cohen_kappa_score, confusion_matrix
 import utils.util as utils
@@ -27,16 +28,19 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
             mask = batch.get('mask')
             channel_mask = batch.get('channel_mask')
             time_mask = batch.get('time_mask')
+            feature_mask = batch.get('feature_mask') # New
             dropped_items += int(batch.get('dropped', 0) or 0)
         elif len(batch) == 2:
             x, y = batch
             mask = None
             channel_mask = None
             time_mask = None
+            feature_mask = None
         else:
             x, y, mask = batch 
             channel_mask = None
             time_mask = None
+            feature_mask = None
 
         x = x.to(device).float()
         
@@ -57,6 +61,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
              channel_mask = channel_mask.to(device)
         if time_mask is not None:
              time_mask = time_mask.to(device)
+        if feature_mask is not None:
+             feature_mask = feature_mask.to(device)
 
         optimizer.zero_grad()
         
@@ -86,8 +92,22 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
              
              # Feature loss
              if feature_pred is not None and target_features is not None:
-                 feat_loss = F.mse_loss(feature_pred, target_features)
-                 metric_logger.update(loss_feat=feat_loss.item())
+                loss_elementwise = F.mse_loss(feature_pred, target_features, reduction='none')
+                
+                if feature_mask is not None:
+                    # Masked MSE
+                    loss_elementwise = loss_elementwise * feature_mask
+                    # Divide by number of valid elements
+                    # Avoid division by zero
+                    num_valid = feature_mask.sum()
+                    if num_valid > 0:
+                        feat_loss = loss_elementwise.sum() / num_valid
+                    else:
+                        feat_loss = 0.0 * loss_elementwise.sum() # Keep graph
+                else:
+                    feat_loss = loss_elementwise.mean()
+                    
+                metric_logger.update(loss_feat=feat_loss.item())
                  
              # Dynamic Balancing
              if recon_loss is not None and feat_loss is not None:
@@ -227,6 +247,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, sche
 @torch.no_grad()
 def evaluate(model, dataloader, criterion, device, task_type="classification", log_writer=None, epoch=None, header='Test:', log_prefix=None, limit_batches=None, verbose=True):
     model.eval()
+    eval_start_t = time.perf_counter()
     metric_logger = utils.MetricLogger(delimiter="  ")
     
     preds = []
@@ -240,6 +261,7 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
     if verbose:
         iterator = metric_logger.log_every(dataloader, 50, header)
     else:
+        print(f"{header} start (silent mode): num_batches={len(dataloader)}, limit_batches={limit_batches}")
         iterator = dataloader
     
     # Check if dataloader is empty
@@ -274,12 +296,15 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
             x = batch['x']
             y = batch['y']
             mask = batch.get('mask')
+            feature_mask = batch.get('feature_mask') # New
             dropped_items += int(batch.get('dropped', 0) or 0)
         elif len(batch) == 2:
             x, y = batch
             mask = None
+            feature_mask = None
         else:
             x, y, mask = batch
+            feature_mask = None
             
         x = x.to(device).float()
         
@@ -295,6 +320,8 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
             
         if mask is not None:
              mask = mask.to(device)
+        if feature_mask is not None:
+             feature_mask = feature_mask.to(device)
         
         # Forward pass
         if task_type == "pretraining":
@@ -324,7 +351,18 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
                      metric_logger.update(recon_r2=metrics_recon['r2'])
                  
                  if feature_pred is not None and target_features is not None:
-                     loss_feat = F.mse_loss(feature_pred, target_features)
+                     loss_feat_val = F.mse_loss(feature_pred, target_features, reduction='none')
+                     
+                     if feature_mask is not None:
+                         loss_feat_val = loss_feat_val * feature_mask
+                         num_valid = feature_mask.sum()
+                         if num_valid > 0:
+                             loss_feat = loss_feat_val.sum() / num_valid
+                         else:
+                             loss_feat = 0.0 * loss_feat_val.sum()
+                     else:
+                         loss_feat = loss_feat_val.mean()
+                         
                      loss = loss + loss_feat # Accumulate feature loss
                      metrics_feat = utils.calc_regression_metrics(feature_pred, target_features)
                      metric_logger.update(feat_pcc=metrics_feat['pcc'])
@@ -513,5 +551,8 @@ def evaluate(model, dataloader, criterion, device, task_type="classification", l
             log_data[key] = v
             
         log_writer.log(log_data)
+
+    if not verbose:
+        print(f"{header} done (silent mode): elapsed={time.perf_counter() - eval_start_t:.2f}s")
             
     return metrics

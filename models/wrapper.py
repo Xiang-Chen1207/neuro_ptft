@@ -6,6 +6,22 @@ try:
     from .eegmamba import EEGMambaBackbone
 except ImportError:
     EEGMambaBackbone = None
+try:
+    from .eegmamba_prefix import EEGMambaBackbonePrefix
+except ImportError:
+    EEGMambaBackbonePrefix = None
+try:
+    from .st_eegformer_mae import ST_EEGFormer_MAE
+except ImportError:
+    ST_EEGFormer_MAE = None
+try:
+    from .reve import ReveBackbone
+except ImportError:
+    ReveBackbone = None
+try:
+    from .tech.backbone import TeChBackbone
+except ImportError:
+    TeChBackbone = None
 
 class CBraModWrapper(nn.Module):
     def __init__(self, config):
@@ -27,6 +43,48 @@ class CBraModWrapper(nn.Module):
                 n_layer=model_config.get('n_layer', 12),
                 nhead=model_config.get('nhead', 8)
             )
+        elif model_name == 'eegmamba_prefix':
+             if EEGMambaBackbonePrefix is None:
+                 raise ImportError("EEGMambaBackbonePrefix could not be imported. Check for circular imports or missing file.")
+             self.backbone = EEGMambaBackbonePrefix(
+                in_dim=model_config.get('in_dim', 200),
+                d_model=model_config.get('d_model', 200),
+                dim_feedforward=model_config.get('dim_feedforward', 800),
+                seq_len=model_config.get('seq_len', 30),
+                n_layer=model_config.get('n_layer', 12),
+                nhead=model_config.get('nhead', 8),
+                feature_dim=model_config.get('feature_dim', 0),
+                num_feature_tokens=model_config.get('num_feature_tokens', 1)
+            )
+        elif model_name == 'st_eegformer_mae':
+             self.backbone = ST_EEGFormer_MAE(
+                in_dim=model_config.get('in_dim', 200),
+                d_model=model_config.get('d_model', 512),
+                depth=model_config.get('n_layer', 8),
+                nhead=model_config.get('nhead', 8),
+                mlp_ratio=model_config.get('mlp_ratio', 4.0),
+                decoder_depth=model_config.get('decoder_depth', 4),
+                decoder_embed_dim=model_config.get('decoder_embed_dim', 384),
+                decoder_num_heads=model_config.get('decoder_num_heads', 16),
+                seq_len=model_config.get('seq_len', 60),
+                num_channels=model_config.get('num_channels', 20)
+             )
+        elif model_name == 'reve':
+             self.backbone = ReveBackbone(
+                in_dim=model_config.get('in_dim', 200),
+                d_model=model_config.get('d_model', 512),
+                seq_len=model_config.get('seq_len', 60),
+                n_layer=model_config.get('n_layer', 12),
+                nhead=model_config.get('nhead', 8),
+                mlp_dim_ratio=model_config.get('mlp_dim_ratio', 4.0),
+                freqs=model_config.get('freqs', 4),
+                noise_ratio=model_config.get('noise_ratio', 0.0025),
+                patch_overlap=model_config.get('patch_overlap', 0)
+             )
+        elif model_name == 'tech':
+             if TeChBackbone is None:
+                 raise ImportError("TeChBackbone could not be imported.")
+             self.backbone = TeChBackbone(**model_config)
         else:
             self.backbone = CBraModBackbone(
                 in_dim=model_config.get('in_dim', 200),
@@ -66,6 +124,8 @@ class CBraModWrapper(nn.Module):
         if 'feature_pred' in self.pretrain_tasks and self.feature_dim > 0:
             if self.feature_token_type == 'cross_attn':
                 self._init_cross_attn_feature_head()
+            elif self.feature_token_type == 'prefix':
+                self._init_prefix_feature_head()
             else:
                 self._init_gap_feature_head()
         else:
@@ -101,6 +161,13 @@ class CBraModWrapper(nn.Module):
             )
 
     def _init_gap_feature_head(self):
+        self.feature_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU(),
+            nn.Linear(self.d_model, self.feature_dim)
+        )
+
+    def _init_prefix_feature_head(self):
         self.feature_head = nn.Sequential(
             nn.Linear(self.d_model, self.d_model),
             nn.ReLU(),
@@ -220,10 +287,20 @@ class CBraModWrapper(nn.Module):
             return self._forward_classification(x, channel_mask, time_mask)
 
     def _forward_pretraining(self, x, mask=None, channel_mask=None, time_mask=None):
+        if ST_EEGFormer_MAE is not None and isinstance(self.backbone, ST_EEGFormer_MAE):
+            # MAE handles masking and reconstruction internally
+            pred, mask = self.backbone(x, channel_mask=channel_mask, time_mask=time_mask)
+            return pred, mask, None
+
         if mask is None:
             mask = self._generate_mask(x, channel_mask=channel_mask, time_mask=time_mask)
-            
-        feats = self.backbone(x, mask, channel_mask=channel_mask, time_mask=time_mask)
+        
+        # Check if backbone is prefix version
+        if hasattr(self.backbone, 'feature_dim') and isinstance(self.backbone, EEGMambaBackbonePrefix):
+             feats, feat_tokens_out = self.backbone(x, mask, channel_mask=channel_mask, time_mask=time_mask)
+        else:
+             feats = self.backbone(x, mask, channel_mask=channel_mask, time_mask=time_mask)
+             feat_tokens_out = None
         
         # Reconstruction Output
         out = self.head(feats) if self.head is not None else None
@@ -233,6 +310,11 @@ class CBraModWrapper(nn.Module):
         if getattr(self, 'feature_head', None) is not None:
             if self.feature_token_type == 'cross_attn':
                 feature_pred = self._forward_cross_attn_head(feats)
+            elif self.feature_token_type == 'prefix' and feat_tokens_out is not None:
+                if feat_tokens_out.shape[1] == 1:
+                     feature_pred = self.feature_head(feat_tokens_out.squeeze(1))
+                else:
+                     feature_pred = self.feature_head(feat_tokens_out.flatten(1))
             else:
                 feature_pred = self._forward_gap_head(feats)
                 
@@ -244,15 +326,27 @@ class CBraModWrapper(nn.Module):
         # Check for custom heads
         if getattr(self, 'feat_query', None) is not None:
             # 1. Compute Cross Attn Features (Feat Path)
-            B, C, N, D = feats.shape
-            feats_flat = feats.view(B, C * N, D)
+            if feats.ndim == 2:
+                # (B, D) -> (B, 1, D)
+                feats_flat = feats.unsqueeze(1)
+                B, D = feats.shape
+            else:
+                B, C, N, D = feats.shape
+                feats_flat = feats.view(B, C * N, D)
+            
             query = self.feat_query.expand(B, -1, -1)
             attn_output, _ = self.feat_attn(query, feats_flat, feats_flat)
             feat_token = attn_output.squeeze(1) # (B, 200)
 
             if hasattr(self, 'fc_norm') and isinstance(self.fc_norm, nn.LayerNorm) and hasattr(self, 'feat_head_mlp') and self.head.in_features == 400:
                  # Flagship Concat
-                 pooled = feats.mean(dim=[1, 2])
+                 if feats.ndim == 4:
+                    pooled = feats.mean(dim=[1, 2])
+                 elif feats.ndim == 3:
+                    pooled = feats.mean(dim=1)
+                 else:
+                    pooled = feats
+                 
                  eeg_feat = self.fc_norm(pooled) # (B, 200)
                  concat_feat = torch.cat([eeg_feat, feat_token], dim=1) # (B, 400)
                  return self.head(concat_feat)
@@ -264,7 +358,12 @@ class CBraModWrapper(nn.Module):
         
         if isinstance(self.fc_norm, nn.LayerNorm):
             # Global Average Pooling
-            pooled = feats.mean(dim=[1, 2])
+            if feats.ndim == 4:
+                pooled = feats.mean(dim=[1, 2])
+            elif feats.ndim == 3:
+                pooled = feats.mean(dim=1)
+            else:
+                pooled = feats
             out = self.head(self.fc_norm(pooled))
         else:
             out = self.head(feats)
@@ -292,8 +391,12 @@ class CBraModWrapper(nn.Module):
 
     def _forward_cross_attn_head(self, feats):
         # feats: (B, C, N, D) -> (B, S, D) where S = C*N
-        B, C, N, D = feats.shape
-        feats_flat = feats.view(B, C * N, D)
+        if feats.ndim == 2:
+            B, D = feats.shape
+            feats_flat = feats.unsqueeze(1)
+        else:
+            B, C, N, D = feats.shape
+            feats_flat = feats.reshape(B, C * N, D)
         
         # Expand query: (B, num_tokens, D)
         query = self.feat_query.expand(B, -1, -1)
@@ -310,5 +413,10 @@ class CBraModWrapper(nn.Module):
         return None
 
     def _forward_gap_head(self, feats):
-        global_feat = feats.mean(dim=[1, 2])
+        if feats.ndim == 4:
+            global_feat = feats.mean(dim=[1, 2])
+        elif feats.ndim == 3:
+            global_feat = feats.mean(dim=1)
+        else:
+            global_feat = feats
         return self.feature_head(global_feat)

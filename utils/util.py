@@ -193,8 +193,14 @@ class WandbLogger:
         if not enable_wandb:
             return
 
+        # Prioritize environment variable for security
+        # If api_key is in config, use it but warn about security risk
         if config.get('api_key'):
-            os.environ['WANDB_API_KEY'] = config['api_key']
+            if os.environ.get('WANDB_API_KEY'):
+                print("Warning: WANDB_API_KEY found in both environment variable and config. Using environment variable.")
+            else:
+                print("Warning: api_key found in config file. For security, consider using WANDB_API_KEY environment variable instead.")
+                os.environ['WANDB_API_KEY'] = config['api_key']
 
         mode = config.get('wandb_mode') or os.environ.get('WANDB_MODE')
         if isinstance(mode, str):

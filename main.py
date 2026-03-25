@@ -85,10 +85,23 @@ def main():
         # TUEGDataset takes file_list. builder.py likely globs files.
         # Let's check builder.py. Assuming we can pass 'tiny': True to config['dataset']
         config['dataset']['tiny'] = True
+
+    if 'dataset' not in config:
+        raise ValueError("Config must contain 'dataset' section.")
+    if 'batch_size' not in config['dataset']:
+        raise ValueError("Config dataset must contain 'batch_size'.")
+    expected_batch_size = int(config['dataset']['batch_size'])
+    print(f"Configured dataset.batch_size={expected_batch_size}")
     
     # 1. Build Datasets
     print("Building datasets...")
     train_loader = build_dataloader(config['dataset']['name'], config['dataset'], mode='train')
+    train_batch_size = int(getattr(train_loader, 'batch_size', 0))
+    print(f"Train DataLoader batch_size={train_batch_size}")
+    if train_batch_size != expected_batch_size:
+        raise ValueError(
+            f"Batch size mismatch: configured {expected_batch_size}, train loader {train_batch_size}"
+        )
     
     # Auto-sync feature_dim from dataset to model config
     # This ensures that if the feature CSV changes (e.g. reduced features), 
@@ -113,6 +126,12 @@ def main():
     if config.get('val_freq_split', 0) > 0:
         print("Building validation dataset (mini-split for monitoring)...")
         val_loader = build_dataloader(config['dataset']['name'], config['dataset'], mode='val')
+        val_batch_size = int(getattr(val_loader, 'batch_size', 0))
+        print(f"Val DataLoader batch_size={val_batch_size}")
+        if val_batch_size != expected_batch_size:
+            raise ValueError(
+                f"Batch size mismatch: configured {expected_batch_size}, val loader {val_batch_size}"
+            )
     
     # 2. Build Model
     print("Building model...")

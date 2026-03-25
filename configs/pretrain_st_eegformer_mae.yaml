@@ -1,0 +1,60 @@
+task_type: pretraining
+output_dir: output/pretrain_st_eegformer_mae
+device: cuda
+epochs: 100
+clip_grad: 1.0
+metric_key: loss
+val_freq_split: 5
+
+enable_wandb: true
+project: "eeg-knowledge-engine"
+entity: "bci-foundation-model"
+
+dataset:
+  name: JOINT
+  data_csv: datasets/data.csv
+  seed: 42
+  batch_size: 128
+  num_workers: 8
+  cache_path: output/pretrain_st_eegformer_mae/dataset_index.json
+  feature_path: '/vePFS-0x0d/home/cx/ptft/eeg_feature_extraction/results'
+
+model:
+  name: st_eegformer_mae
+  use_pretrained: false
+  
+  # Input Specs
+  in_dim: 200
+  seq_len: 60
+  num_channels: 128
+  
+  # Encoder (Small/Base hybrid)
+  d_model: 512
+  n_layer: 8
+  nhead: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  
+  # Decoder
+  decoder_depth: 4
+  decoder_embed_dim: 384
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4.0
+  
+  # Task
+  pretrain_tasks: ['reconstruction']
+  out_dim: 200
+
+loss:
+  name: mse
+  feature_loss_weight: 0.0
+  
+optimizer:
+  name: AdamW
+  lr: 3e-4
+  weight_decay: 0.05
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 100
+  eta_min: 1.0e-6

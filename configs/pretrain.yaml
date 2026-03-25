@@ -10,7 +10,8 @@ val_freq_split: 5 # How many times to validate per epoch (0 to disable)
 enable_wandb: true
 project: "eeg-knowledge-engine"
 entity: "bci-foundation-model"
-api_key: "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"
+# api_key: Set via WANDB_API_KEY environment variable for security
+# Example: export WANDB_API_KEY="your-api-key-here"
 
 dataset:
   name: TUEG

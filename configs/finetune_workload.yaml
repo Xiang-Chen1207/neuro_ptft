@@ -1,0 +1,48 @@
+task_type: classification
+output_dir: output/finetune_workload
+device: cuda
+epochs: 20
+clip_grad: 1.0
+metric_key: balanced_acc
+val_freq_split: 1
+
+# Logging
+enable_wandb: false
+project: "ptft-project-workload"
+entity: "bci-foundation-model"
+
+# Dataset Selection
+selected_dataset: Workload
+
+datasets:
+  Workload:
+    name: Workload
+    dataset_dir: /vePFS-0x0d/eeg-data/Workload
+    cache_path: output/finetune_workload/dataset_index.json
+    seed: 42
+    batch_size: 128
+    num_workers: 8
+    input_size: 200   # 1s * 200Hz = 1 patch
+    patch_size: 200
+    test_ratio: 0.2
+
+model:
+  use_pretrained: true
+  pretrained_path: ""
+  in_dim: 200
+  d_model: 200
+  dim_feedforward: 800
+  seq_len: 1          # 200 / 200 = 1 patch
+  n_layer: 12
+  nhead: 8
+  dropout: 0.1
+  num_classes: 3      # low / mid / high workload
+  head_type: pooling
+
+loss:
+  name: cross_entropy
+
+optimizer:
+  name: AdamW
+  lr: 0.0001
+  weight_decay: 0.05

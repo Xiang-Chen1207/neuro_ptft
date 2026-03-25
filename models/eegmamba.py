@@ -18,8 +18,8 @@ class EEGMambaBackbone(nn.Module):
         config.rms_norm = False
         config.fused_add_norm = False
         config.ssm_cfg = {
-            "layer": "Mamba2",
-            "headdim": 50,
+            # Mamba1 is numerically more stable than Mamba2 in the current runtime stack.
+            "layer": "Mamba1",
             "d_state": 64,
         }
         self.encoder = MixerModel(

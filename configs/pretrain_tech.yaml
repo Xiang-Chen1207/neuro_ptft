@@ -1,0 +1,55 @@
+task_type: pretraining
+output_dir: output/pretrain_tech
+device: cuda
+epochs: 40
+clip_grad: 1.0
+metric_key: loss
+val_freq_split: 10
+
+enable_wandb: false
+project: "ptft-tech-pretrain"
+entity: "cx2521-new-york-university"
+
+dataset:
+  name: TUEG
+  dataset_dir: /vePFS-0x0d/pretrain-clip/output_tuh_full_pipeline/merged_final_dataset
+  seed: 42
+  batch_size: 512
+  num_workers: 8
+  cache_path: output/pretrain_tech/dataset_index.json
+  feature_path: '/vePFS-0x0d/pretrain-clip/feature_analysis/features_final_zscore.csv'
+
+model:
+  name: tech
+  use_pretrained: false
+  in_dim: 200 # patch size (used for P)
+  d_model: 200
+  seq_len: 30 # num patches (used for N)
+  n_layer: 2 # v_layer and t_layer
+  nhead: 8
+  dropout: 0.1
+  
+  # TeCh specific
+  augmentations: "jitter,scale,mask,channel"
+  patch_len: 200 # Should match in_dim for TeCh logic?
+  
+  pretrain_tasks: ['feature_pred'] 
+  
+  feature_dim: 62
+  feature_token_type: 'gap'
+  feature_token_strategy: 'single'
+  feature_group_count: 5
+
+loss:
+  name: mse
+  feature_loss_weight: 1.0
+  
+optimizer:
+  name: AdamW
+  lr: 0.001
+  weight_decay: 0.05
+
+scheduler:
+  name: CosineAnnealingLR
+  T_max: 40
+  eta_min: 1.0e-6

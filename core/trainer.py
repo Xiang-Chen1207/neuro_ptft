@@ -281,6 +281,9 @@ class Trainer:
         self.log_writer.finish()
             
     def save_checkpoint(self, filename, epoch=None, best_metric=None):
+        if not self.config.get('save_checkpoints', True):
+            print(f"Skipping checkpoint save (save_checkpoints=false): {filename}")
+            return
         path = self.output_dir / filename
         model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         checkpoint = {
@@ -305,11 +308,24 @@ class Trainer:
         model_to_load.load_state_dict(checkpoint['model_state_dict'])
 
         # Load optimizer state
-        # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("Optimizer state restored successfully")
+            except Exception as e:
+                print(f"Warning: Failed to load optimizer state: {e}. Continuing with fresh optimizer state.")
+        else:
+            print("Warning: No optimizer state found in checkpoint. Using fresh optimizer state.")
 
         # Load scheduler state if available
-        # if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        #    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("Scheduler state restored successfully")
+            except Exception as e:
+                print(f"Warning: Failed to load scheduler state: {e}. Continuing with fresh scheduler state.")
+        elif self.scheduler is not None:
+            print("Warning: No scheduler state found in checkpoint. Using fresh scheduler state.")
 
         # Get epoch and best_metric
         start_epoch = checkpoint.get('epoch', -1) + 1  # Resume from next epoch
